@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bb-code"
+version = "0.1.0"
+description = "Buildly Marketplace local-first coding workspace, AI assistant, and cloud-native diagnostics tool."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Buildly Forge License (BSL-1.1, converts to Apache-2.0)" }
+authors = [
+  { name = "Buildly" }
+]
+dependencies = [
+  "typer>=0.12.0",
+  "rich>=13.7.0",
+  "requests>=2.31.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0"
+]
+
+[project.scripts]
+bb-code = "bb_code.cli:app"
+build = "bb_code.web_cli:app"
+
+[tool.setuptools.packages.find]
+include = ["bb_code*"]

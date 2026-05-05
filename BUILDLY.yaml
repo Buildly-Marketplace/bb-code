@@ -1,0 +1,42 @@
+name: bb-code
+slug: bb-code
+version: 0.1.0
+summary: Local-first AI coding workspace with multi-repo, model, Kubernetes, and platform diagnostics.
+description: |
+  bb-code is a Buildly Marketplace coding assistant and local web workspace. It provides
+  repository exploration, model configuration, Ollama or remote OpenAI-compatible routing,
+  cloud-native service inventory, read-only Kubernetes diagnostics, and Markdown/HTML
+  platform reports for app and microservice refactor planning.
+license: BSL-1.1
+categories: [developer-tools, ai, kubernetes, diagnostics, cloud-native]
+targets:
+  - type: python-cli
+    package: bb-code
+    commands: ["bb-code", "build"]
+  - type: local-web
+    command: build --no-open --port 8791 .
+    ports: ["8791:8791"]
+requirements:
+  cpu: "250m+"
+  ram: "256MB+"
+  storage: "512MB+"
+  deps: [python-3.11, optional-ollama, optional-kubectl, optional-gcloud]
+  permissions: [local-filesystem-read, local-workspace-write, optional-cluster-read]
+features:
+  - Local-first repository planning and diagnostics
+  - VS Code-like browser workspace UI
+  - Ollama and OpenAI-compatible model settings
+  - Multi-repo explorer context
+  - Cloud-native service inventory
+  - Read-only Kubernetes context and workload diagnostics
+  - Markdown and rendered HTML platform reports
+security:
+  cluster_access: read-only by default
+  mutating_actions: confirmation-gated when added
+  secrets_policy: do-not-log-or-transmit
+  scanned: false
+  sbom_included: false
+maintainer:
+  name: Buildly Labs
+  email: support@buildly.io
+  verified: true
