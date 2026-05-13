@@ -62,6 +62,9 @@ TEXT_SUFFIXES = {
 
 UI_STATE_FILE = "web_state.json"
 REPORTS_DIR = "reports"
+K8S_MONITOR_RELATIVE_PATH = Path("integrations") / "k8s-monitor"
+K8S_MONITOR_REPO_URL = "https://github.com/Buildly-Marketplace/k8s-monitor"
+K8S_MONITOR_DEFAULT_URL = "http://127.0.0.1:8000/"
 
 
 class WorkspaceSession:
@@ -285,6 +288,57 @@ def _process_command(pid: str) -> str:
     if completed.returncode != 0:
         return ""
     return completed.stdout.strip()
+
+
+def application_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def k8s_monitor_integration_status(app_root: Path | None = None) -> dict[str, Any]:
+    root = app_root or application_root()
+    path = root / K8S_MONITOR_RELATIVE_PATH
+    installed = path.exists() and path.is_dir() and (path / "main.py").exists()
+    status: dict[str, Any] = {
+        "name": "ForgeOps / k8s-monitor",
+        "installed": installed,
+        "path": relative(path, root),
+        "repository": K8S_MONITOR_REPO_URL,
+        "dashboardUrl": K8S_MONITOR_DEFAULT_URL,
+        "docsUrl": f"{K8S_MONITOR_REPO_URL}#readme",
+        "installCommand": "git submodule update --init --recursive integrations/k8s-monitor",
+        "startCommands": [
+            "cd integrations/k8s-monitor && python main.py",
+            "cd integrations/k8s-monitor && docker compose -f ops/docker-compose.yml up",
+        ],
+        "notes": [
+            "bb-code links to ForgeOps when the submodule is installed.",
+            "bb-code does not start ForgeOps automatically because it can read Kubernetes credentials.",
+        ],
+    }
+    if not installed:
+        return status
+
+    buildly_yaml = path / "BUILDLY.yaml"
+    if buildly_yaml.exists():
+        status["manifest"] = relative(buildly_yaml, root)
+    status["commit"] = _git_value(path, ["rev-parse", "--short", "HEAD"])
+    status["branch"] = _git_value(path, ["rev-parse", "--abbrev-ref", "HEAD"])
+    status["healthUrl"] = K8S_MONITOR_DEFAULT_URL.rstrip("/") + "/health"
+    return status
+
+
+def _git_value(path: Path, args: list[str]) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return completed.stdout.strip() if completed.returncode == 0 else ""
 
 
 def collect_workspace(root: Path) -> dict[str, Any]:
@@ -1029,7 +1083,13 @@ def parse_edit_suggestions(root: Path, raw: str) -> list[dict[str, str]]:
         content = _materialize_edit_content(original, edit)
         if content is None or _looks_like_truncated_replacement(original, content):
             continue
-        parsed.append({"path": relative(safe_path, root), "summary": summary, "content": content})
+        entry = {"path": relative(safe_path, root), "summary": summary, "content": content, "original": original}
+        raw_find = edit.get("find")
+        raw_replace = edit.get("replace")
+        if isinstance(raw_find, str) and isinstance(raw_replace, str) and raw_find:
+            entry["find"] = raw_find
+            entry["replace"] = raw_replace
+        parsed.append(entry)
     return parsed
 
 
@@ -1680,6 +1740,8 @@ def _make_handler(session: WorkspaceSession) -> type[BaseHTTPRequestHandler]:
                 elif parsed.path == "/api/lint":
                     rel_path = parse_qs(parsed.query).get("path", [""])[0]
                     self._send_json(lint_workspace_file(root, rel_path))
+                elif parsed.path == "/api/integrations/k8s-monitor":
+                    self._send_json(k8s_monitor_integration_status())
                 elif parsed.path == "/reports":
                     rel_path = parse_qs(parsed.query).get("path", [""])[0]
                     markdown = read_report_file(root, rel_path)
@@ -2052,9 +2114,20 @@ APP_HTML = r"""<!doctype html>
     .loading { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
     .spinner { width: 12px; height: 12px; border: 2px solid #555; border-top-color: var(--blue); border-radius: 50%; animation: spin .8s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .edit-card { border: 1px solid #4a4a4a; border-radius: 6px; padding: 8px; background: #1f2a30; display: grid; gap: 8px; }
+    .edit-card { border: 1px solid #4a4a4a; border-radius: 6px; padding: 8px; background: #1f2a30; display: grid; gap: 6px; }
     .edit-card code { color: #d7ba7d; }
-    .edit-card button { justify-self: start; }
+    .edit-card button { flex-shrink: 0; }
+    .diff-view { max-height: 280px; overflow: auto; border: 1px solid var(--line); border-radius: 3px; margin: 2px 0; background: #181818; }
+    .diff-line { padding: 1px 10px; white-space: pre; font: 11.5px/1.45 "SFMono-Regular", Consolas, Menlo, monospace; }
+    .diff-add { background: #1a3326; color: #89d185; }
+    .diff-remove { background: #3a1e1e; color: #f48771; }
+    .diff-same { color: #555; }
+    .diff-hunk { color: #7ab; background: #1a2530; font-size: 11px; font-style: italic; }
+    .edit-status { font-size: 11px; font-weight: 600; }
+    .edit-batch { display: flex; gap: 8px; align-items: center; padding: 4px 0 8px; }
+    details > summary { cursor: pointer; color: var(--muted); font-size: 11px; padding: 2px 0; user-select: none; outline: none; list-style: none; }
+    details > summary::before { content: "\25B8 "; }
+    details[open] > summary::before { content: "\25BE "; }
     .composer { position: absolute; left: 0; right: 0; bottom: 0; height: 142px; z-index: 3; background: var(--panel); border-top: 1px solid var(--line); padding: 8px; display: grid; grid-template-rows: minmax(0, 1fr) auto; gap: 8px; min-height: 0; overflow: hidden; }
     textarea {
       width: 100%; height: 84px; min-height: 0; resize: none; border: 1px solid var(--line);
@@ -2262,8 +2335,8 @@ APP_HTML = r"""<!doctype html>
     function showRun() {
       $("sideHead").textContent = "Run and Debug";
       $("sideTool").className = "side-tool";
-      $("sideTool").innerHTML = `<button id="runDiagnostics" class="small">Run Diagnostics</button><button id="runTests" class="small">Run Tests</button><button id="runCloudAudit" class="small">Cloud Audit</button><button id="runKubectlDiagnostics" class="small">Kubernetes Diagnostics</button><button id="runPlatformReport" class="small">Platform Report</button>`;
-      $("tree").innerHTML = `<div class="muted" style="padding:8px">Run diagnostics, tests, cloud audits, read-only Kubernetes checks, or saved platform reports. No arbitrary commands are executed.</div>`;
+      $("sideTool").innerHTML = `<button id="runDiagnostics" class="small">Run Diagnostics</button><button id="runTests" class="small">Run Tests</button><button id="runCloudAudit" class="small">Cloud Audit</button><button id="runKubectlDiagnostics" class="small">Kubernetes Diagnostics</button><button id="runPlatformReport" class="small">Platform Report</button><button id="showK8sMonitor" class="small">K8s Monitor</button>`;
+      $("tree").innerHTML = `<div class="muted" style="padding:8px">Run diagnostics, tests, cloud audits, read-only Kubernetes checks, saved platform reports, or open installed integrations. No arbitrary commands are executed.</div>`;
       $("runDiagnostics").addEventListener("click", async () => {
         await loadPanel("diagnostics");
         $("tree").innerHTML = `<div class="muted" style="padding:8px">Diagnostics refreshed in the bottom panel.</div>`;
@@ -2272,6 +2345,7 @@ APP_HTML = r"""<!doctype html>
       $("runCloudAudit").addEventListener("click", runCloudAudit);
       $("runKubectlDiagnostics").addEventListener("click", runKubectlDiagnostics);
       $("runPlatformReport").addEventListener("click", runPlatformReport);
+      $("showK8sMonitor").addEventListener("click", showK8sMonitor);
     }
 
     async function runTests() {
@@ -2400,6 +2474,62 @@ APP_HTML = r"""<!doctype html>
         const href = `/reports?path=${encodeURIComponent(report.path)}`;
         return `<a href="${href}" target="_blank" rel="noopener">${escapeHtml(report.name || report.path)}</a>`;
       }).join("")}</div>`;
+    }
+
+    async function showK8sMonitor() {
+      setStatus("Checking k8s-monitor integration...");
+      $("tree").innerHTML = `<div class="muted" style="padding:8px">Checking integrations/k8s-monitor...</div>`;
+      try {
+        const data = await api("/api/integrations/k8s-monitor");
+        $("tree").innerHTML = renderK8sMonitorSummary(data);
+        $("panelBody").innerHTML = renderK8sMonitorPanel(data);
+        setStatus(data.installed ? "K8s monitor installed" : "K8s monitor not installed");
+      } catch (error) {
+        $("tree").innerHTML = `<div class="muted" style="padding:8px">K8s monitor check failed.</div>`;
+        $("panelBody").textContent = `K8s monitor check failed: ${error}`;
+        setStatus("K8s monitor error");
+      }
+    }
+
+    function renderK8sMonitorSummary(data) {
+      const lines = [
+        data.name || "ForgeOps / k8s-monitor",
+        `installed: ${data.installed ? "yes" : "no"}`,
+        `path: ${data.path || "integrations/k8s-monitor"}`,
+        data.commit ? `commit: ${data.commit}` : "",
+        data.branch ? `branch: ${data.branch}` : ""
+      ].filter(Boolean).join("\n");
+      const links = data.installed
+        ? `<div class="report-links"><a href="${escapeHtml(data.dashboardUrl)}" target="_blank" rel="noopener">Open ForgeOps dashboard</a><a href="${escapeHtml(data.docsUrl)}" target="_blank" rel="noopener">ForgeOps docs</a></div>`
+        : "";
+      return `<pre style="background:transparent;padding:8px;color:#d4d4d4">${escapeHtml(lines)}</pre>${links}`;
+    }
+
+    function renderK8sMonitorPanel(data) {
+      const startCommands = (data.startCommands || []).map(command => `- ${command}`).join("\n");
+      const notes = (data.notes || []).map(note => `- ${note}`).join("\n");
+      const markdown = [
+        "# ForgeOps / k8s-monitor Integration",
+        "",
+        `Installed: ${data.installed ? "yes" : "no"}`,
+        `Path: ${data.path || "integrations/k8s-monitor"}`,
+        `Repository: ${data.repository || ""}`,
+        data.commit ? `Commit: ${data.commit}` : "",
+        "",
+        "## Links",
+        data.installed ? `- Dashboard: ${data.dashboardUrl}` : "- Dashboard link appears after the submodule is installed.",
+        `- Docs: ${data.docsUrl || ""}`,
+        "",
+        "## Install",
+        `- ${data.installCommand || "git submodule update --init --recursive integrations/k8s-monitor"}`,
+        "",
+        "## Start",
+        startCommands || "- Start command unavailable.",
+        "",
+        "## Notes",
+        notes || "- No notes."
+      ].filter(line => line !== "").join("\n");
+      return `<pre style="background:transparent;padding:8px;color:#d4d4d4">${escapeHtml(markdown)}</pre>`;
     }
 
     async function showSettings() {
@@ -2573,29 +2703,140 @@ APP_HTML = r"""<!doctype html>
     }
 
     function addEditSuggestions(edits) {
-      const wrap = document.createElement("div");
-      wrap.className = "msg assistant";
-      wrap.appendChild(document.createTextNode("Suggested edits. Review before applying:"));
-      edits.forEach((edit, index) => {
+      if (!edits || !edits.length) return;
+      const n = edits.length;
+      const msg = document.createElement("div");
+      msg.className = "msg assistant";
+      msg.innerHTML = `<div style="margin-bottom:8px">I have identified <strong>${n}</strong> code change${n > 1 ? "s" : ""} to implement. Review before applying?</div><div class="edit-actions" style="display:flex;gap:8px"><button class="small review-btn">Review Changes</button><button class="small decline-btn" style="background:#3a3d41;color:#aaa">No Thanks</button></div>`;
+      msg.querySelector(".review-btn").addEventListener("click", () => { msg.remove(); showEditDiffs(edits); });
+      msg.querySelector(".decline-btn").addEventListener("click", () => {
+        msg.querySelector(".edit-actions").remove();
+        msg.querySelector("div").textContent = `Declined ${n} suggested change${n > 1 ? "s" : ""}.`;
+      });
+      $("messages").appendChild(msg);
+      $("messages").scrollTop = $("messages").scrollHeight;
+    }
+
+    function showEditDiffs(edits) {
+      const container = document.createElement("div");
+      container.className = "msg assistant";
+      const pending = new Set(edits.map((_, i) => i));
+      const batchBar = document.createElement("div");
+      batchBar.className = "edit-batch";
+      batchBar.innerHTML = `<span style="color:var(--muted)">${edits.length} change${edits.length > 1 ? "s" : ""}</span><button class="small approve-all-btn">Approve All</button><button class="small skip-all-btn" style="background:#3a3d41;color:#aaa">Skip All</button>`;
+      container.appendChild(batchBar);
+      const cards = edits.map((edit, index) => {
+        const diffSrc = edit.find !== undefined
+          ? { old: edit.find, upd: edit.replace }
+          : { old: edit.original || "", upd: edit.content || "" };
+        const diffLines = collapseContext(computeLineDiff(diffSrc.old, diffSrc.upd));
         const card = document.createElement("div");
         card.className = "edit-card";
-        card.innerHTML = `<div><code>${escapeHtml(edit.path)}</code></div><div>${escapeHtml(edit.summary)}</div><button class="small">Apply this edit</button>`;
-        card.querySelector("button").addEventListener("click", async () => {
-          const ok = confirm(`Apply suggested edit to ${edit.path}? This will overwrite that local file.`);
-          if (!ok) return;
-          setStatus(`Applying ${edit.path}`);
-          await api("/api/apply-edit", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ path: edit.path, content: edit.content })
-          });
-          await openFile(edit.path);
-          setStatus(`Applied ${edit.path}`);
-        });
-        wrap.appendChild(card);
+        card.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;min-width:0"><code style="color:#d7ba7d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${escapeHtml(edit.path)}</code><span class="edit-status" style="color:var(--muted);flex-shrink:0">pending</span></div><div style="font-size:11px;color:var(--muted)">${escapeHtml(edit.summary)}</div><details><summary>Show diff</summary><div class="diff-view">${renderDiff(diffLines)}</div></details><div style="display:flex;gap:6px"><button class="small approve-btn">Approve</button><button class="small skip-btn" style="background:#3a3d41;color:#aaa">Skip</button></div>`;
+        card.querySelector(".approve-btn").addEventListener("click", () => applyEditChange(edit, card, pending, index));
+        card.querySelector(".skip-btn").addEventListener("click", () => skipEditChange(card, pending, index));
+        container.appendChild(card);
+        return card;
       });
-      $("messages").appendChild(wrap);
+      batchBar.querySelector(".approve-all-btn").addEventListener("click", async () => {
+        batchBar.querySelector(".approve-all-btn").disabled = true;
+        batchBar.querySelector(".skip-all-btn").disabled = true;
+        for (let i = 0; i < edits.length; i++) {
+          if (pending.has(i)) await applyEditChange(edits[i], cards[i], pending, i);
+        }
+      });
+      batchBar.querySelector(".skip-all-btn").addEventListener("click", () => {
+        [...pending].forEach(i => skipEditChange(cards[i], pending, i));
+        batchBar.querySelector(".approve-all-btn").disabled = true;
+        batchBar.querySelector(".skip-all-btn").disabled = true;
+      });
+      $("messages").appendChild(container);
       $("messages").scrollTop = $("messages").scrollHeight;
+    }
+
+    async function applyEditChange(edit, card, pending, index) {
+      if (!pending.has(index)) return;
+      const statusEl = card.querySelector(".edit-status");
+      statusEl.textContent = "applying\u2026";
+      statusEl.style.color = "var(--yellow)";
+      try {
+        await api("/api/apply-edit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: edit.path, content: edit.content })
+        });
+        pending.delete(index);
+        card.style.opacity = "0.75";
+        statusEl.textContent = "\u2713 applied";
+        statusEl.style.color = "var(--green)";
+        card.querySelector(".approve-btn").disabled = true;
+        card.querySelector(".skip-btn").disabled = true;
+        await openFile(edit.path);
+        setStatus(`Applied ${edit.path}`);
+      } catch (err) {
+        statusEl.textContent = "error";
+        statusEl.style.color = "var(--red)";
+        setStatus(`Failed to apply ${edit.path}`);
+      }
+    }
+
+    function skipEditChange(card, pending, index) {
+      if (!pending.has(index)) return;
+      pending.delete(index);
+      card.style.opacity = "0.5";
+      const statusEl = card.querySelector(".edit-status");
+      statusEl.textContent = "\u2717 skipped";
+      statusEl.style.color = "var(--muted)";
+      card.querySelector(".approve-btn").disabled = true;
+      card.querySelector(".skip-btn").disabled = true;
+    }
+
+    function computeLineDiff(oldText, newText) {
+      const a = (oldText || "").split("\n");
+      const b = (newText || "").split("\n");
+      if (a.length > 400 || b.length > 400) {
+        return [
+          { type: "remove", text: `(${a.length} lines removed)` },
+          { type: "add", text: `(${b.length} lines added \u2014 apply to see full result)` }
+        ];
+      }
+      const m = a.length, n = b.length;
+      const dp = Array.from({ length: m + 1 }, () => new Int32Array(n + 1));
+      for (let i = 1; i <= m; i++)
+        for (let j = 1; j <= n; j++)
+          dp[i][j] = a[i-1] === b[j-1] ? dp[i-1][j-1] + 1 : Math.max(dp[i-1][j], dp[i][j-1]);
+      const diff = [];
+      let i = m, j = n;
+      while (i > 0 || j > 0) {
+        if (i > 0 && j > 0 && a[i-1] === b[j-1]) { diff.unshift({ type: "same", text: a[i-1] }); i--; j--; }
+        else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) { diff.unshift({ type: "add", text: b[j-1] }); j--; }
+        else { diff.unshift({ type: "remove", text: a[i-1] }); i--; }
+      }
+      return diff;
+    }
+
+    function collapseContext(diffLines, ctx = 3) {
+      const changed = diffLines.reduce((acc, l, i) => { if (l.type !== "same") acc.push(i); return acc; }, []);
+      if (!changed.length) return [{ type: "same", text: "(no changes detected)" }];
+      const show = new Set();
+      changed.forEach(i => { for (let c = Math.max(0, i - ctx); c <= Math.min(diffLines.length - 1, i + ctx); c++) show.add(c); });
+      const result = [];
+      let last = -1;
+      diffLines.forEach((line, i) => {
+        if (!show.has(i)) return;
+        if (last >= 0 && i > last + 1) result.push({ type: "hunk", text: "@@ \u2026 @@" });
+        result.push(line);
+        last = i;
+      });
+      return result;
+    }
+
+    function renderDiff(diffLines) {
+      return diffLines.map(({ type, text }) => {
+        const prefix = type === "add" ? "+" : type === "remove" ? "-" : " ";
+        const cls = `diff-line ${type === "add" ? "diff-add" : type === "remove" ? "diff-remove" : type === "hunk" ? "diff-hunk" : "diff-same"}`;
+        return `<div class="${cls}">${escapeHtml(prefix + " " + text)}</div>`;
+      }).join("");
     }
 
     function setStatus(text) { $("status").textContent = text; }

@@ -18,6 +18,7 @@ from bb_code.web_ui import (
     collect_workspace,
     find_port_listeners,
     generate_platform_report,
+    k8s_monitor_integration_status,
     lint_workspace_file,
     markdown_to_html,
     normalize_chat_response,
@@ -65,6 +66,12 @@ def test_app_html_exposes_kubectl_diagnostics() -> None:
     assert "/api/kubectl-diagnostics" in APP_HTML
 
 
+def test_app_html_exposes_k8s_monitor_integration() -> None:
+    assert "K8s Monitor" in APP_HTML
+    assert "/api/integrations/k8s-monitor" in APP_HTML
+    assert "Open ForgeOps dashboard" in APP_HTML
+
+
 def test_app_html_exposes_platform_report() -> None:
     assert "Platform Report" in APP_HTML
     assert "/api/platform-report" in APP_HTML
@@ -101,6 +108,27 @@ def test_workspace_session_switch_repo_keeps_container_repos(tmp_path: Path) -> 
     assert workspace["baseRoot"] == str(tmp_path.resolve())
     assert workspace["activeRepo"] == "worker"
     assert [repo["name"] for repo in workspace["repos"]] == ["api", "worker"]
+
+
+def test_k8s_monitor_integration_status_detects_missing_submodule(tmp_path: Path) -> None:
+    status = k8s_monitor_integration_status(tmp_path)
+
+    assert status["installed"] is False
+    assert status["path"] == "integrations/k8s-monitor"
+    assert "git submodule update" in status["installCommand"]
+
+
+def test_k8s_monitor_integration_status_detects_installed_submodule(tmp_path: Path) -> None:
+    integration = tmp_path / "integrations" / "k8s-monitor"
+    integration.mkdir(parents=True)
+    (integration / "main.py").write_text("print('forgeops')\n", encoding="utf-8")
+    (integration / "BUILDLY.yaml").write_text("name: ForgeOps\n", encoding="utf-8")
+
+    status = k8s_monitor_integration_status(tmp_path)
+
+    assert status["installed"] is True
+    assert status["manifest"] == "integrations/k8s-monitor/BUILDLY.yaml"
+    assert status["dashboardUrl"] == "http://127.0.0.1:8000/"
 
 
 def test_collect_session_workspace_reports_active_repo(tmp_path: Path) -> None:
@@ -492,7 +520,10 @@ def test_parse_edit_suggestions_returns_safe_existing_text_file(tmp_path: Path) 
 
     edits = parse_edit_suggestions(tmp_path, raw)
 
-    assert edits == [{"path": "app.py", "summary": "Update greeting", "content": 'print("new")\n'}]
+    assert edits[0]["path"] == "app.py"
+    assert edits[0]["summary"] == "Update greeting"
+    assert edits[0]["content"] == 'print("new")\n'
+    assert edits[0]["original"] == "print('old')\n"
 
 
 def test_parse_edit_suggestions_extracts_json_from_prose(tmp_path: Path) -> None:

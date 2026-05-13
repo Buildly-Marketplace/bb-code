@@ -30,3 +30,13 @@ Settings are saved to `.bb/settings.json` in the launch workspace so they surviv
 ## Kubernetes Diagnostics
 
 If `kubectl` and `gcloud` are on `PATH`, bb-code can include read-only cluster diagnostics in platform reports. It does not switch contexts, authenticate, restart workloads, delete pods, or deploy images by default.
+
+## ForgeOps / k8s-monitor Integration
+
+bb-code tracks ForgeOps as an optional submodule:
+
+```bash
+git submodule update --init --recursive integrations/k8s-monitor
+```
+
+The web UI detects the submodule and shows a `K8s Monitor` Run-panel link to the default ForgeOps dashboard at `http://127.0.0.1:8000/`. bb-code does not start ForgeOps automatically because ForgeOps may read Kubernetes credentials and cluster resources.

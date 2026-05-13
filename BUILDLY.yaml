@@ -29,7 +29,14 @@ features:
   - Multi-repo explorer context
   - Cloud-native service inventory
   - Read-only Kubernetes context and workload diagnostics
+  - Optional ForgeOps/k8s-monitor submodule link
   - Markdown and rendered HTML platform reports
+integrations:
+  - name: ForgeOps / k8s-monitor
+    path: integrations/k8s-monitor
+    repository: https://github.com/Buildly-Marketplace/k8s-monitor
+    dashboard_url: http://127.0.0.1:8000/
+    install: git submodule update --init --recursive integrations/k8s-monitor
 security:
   cluster_access: read-only by default
   mutating_actions: confirmation-gated when added

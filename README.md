@@ -53,6 +53,23 @@ pip install -e ".[dev]"
 pytest -q
 ```
 
+## Optional Integrations
+
+bb-code links to ForgeOps / k8s-monitor when the submodule is installed:
+
+```bash
+git submodule update --init --recursive integrations/k8s-monitor
+```
+
+Start ForgeOps separately when you want the live Kubernetes dashboard:
+
+```bash
+cd integrations/k8s-monitor
+python main.py
+```
+
+Then use the `K8s Monitor` button in the bb-code Run panel to open the dashboard link.
+
 If `bb-code` is not on your shell path after installation, run it through the Python environment that installed it or add that environment's `bin/` directory to `PATH`.
 
 ## Commands
