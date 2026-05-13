@@ -1,0 +1,3 @@
+[submodule "integrations/k8s-monitor"]
+	path = integrations/k8s-monitor
+	url = https://github.com/Buildly-Marketplace/k8s-monitor.git
