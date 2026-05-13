@@ -65,6 +65,8 @@ REPORTS_DIR = "reports"
 K8S_MONITOR_RELATIVE_PATH = Path("integrations") / "k8s-monitor"
 K8S_MONITOR_REPO_URL = "https://github.com/Buildly-Marketplace/k8s-monitor"
 K8S_MONITOR_DEFAULT_URL = "http://127.0.0.1:8000/"
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+LOGO_PATH = Path(__file__).resolve().parents[1] / "forge-logo.png"
 
 
 class WorkspaceSession:
@@ -1721,6 +1723,12 @@ def _make_handler(session: WorkspaceSession) -> type[BaseHTTPRequestHandler]:
                 root = session.root
                 if parsed.path == "/":
                     self._send_html(APP_HTML)
+                elif parsed.path == "/manifest.json":
+                    self._send_static_file("manifest.json", "application/manifest+json")
+                elif parsed.path == "/service-worker.js":
+                    self._send_static_file("service-worker.js", "application/javascript; charset=utf-8")
+                elif parsed.path in {"/icon.png", "/apple-touch-icon.png", "/favicon.ico"}:
+                    self._send_logo_file()
                 elif parsed.path == "/api/workspace":
                     self._send_json(collect_session_workspace(session))
                 elif parsed.path == "/api/context":
@@ -1817,6 +1825,31 @@ def _make_handler(session: WorkspaceSession) -> type[BaseHTTPRequestHandler]:
             body = text.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/markdown; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_static_file(self, filename: str, content_type: str) -> None:
+            path = STATIC_DIR / filename
+            if not path.exists() or not path.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            body = path.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_logo_file(self) -> None:
+            if not LOGO_PATH.exists() or not LOGO_PATH.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            body = LOGO_PATH.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "no-cache")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1999,7 +2032,11 @@ APP_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>bb-code workspace</title>
+    <title>bb-code workspace</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" href="/icon.png" type="image/png">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <meta name="theme-color" content="#1e1e1e">
   <style>
     :root {
       color-scheme: dark;
@@ -2142,15 +2179,26 @@ APP_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-  <div class="shell">
-    <div class="titlebar">
-      <strong>bb-code</strong>
-      <form id="workspaceForm" class="workspace-form">
-        <input id="workspacePath" aria-label="Workspace path" placeholder="Workspace path" />
-        <button type="submit">Open</button>
-      </form>
-    </div>
-    <div class="main">
+    <div class="shell">
+        <div class="titlebar">
+            <strong>bb-code</strong>
+            <span id="cwdDisplay" style="color:var(--muted);font-size:12px;padding-left:10px;max-width:28vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Loading...</span>
+            <select id="recentWorkspaces" aria-label="Recent workspaces" style="max-width:24vw;background:#1b1b1b;color:var(--text);border:1px solid #4a4a4a;border-radius:3px;padding:4px 7px;font:inherit;">
+                <option value="">Recent workspaces</option>
+            </select>
+            <button id="openRecentBtn" type="button" style="background:#3a3d41;color:#ddd;border:0;border-radius:3px;padding:5px 9px;cursor:pointer;">Open</button>
+            <button id="openEditorBtn" type="button" style="background:#3a3d41;color:#ddd;border:0;border-radius:3px;padding:5px 9px;cursor:pointer;">Open in Editor</button>
+            <button id="installBtn" type="button" style="display:none;background:#007acc;color:white;border:0;border-radius:3px;padding:5px 10px;cursor:pointer;font-size:13px;">Install App</button>
+            <form id="workspaceForm" class="workspace-form">
+                <input id="workspacePath" aria-label="Workspace path" placeholder="Workspace path" />
+                <button type="submit">Open</button>
+            </form>
+        </div>
+        <div id="updateBanner" class="status" style="display:none;justify-content:space-between;position:sticky;top:0;z-index:4;background:#f48771;color:#1e1e1e;">
+            <span>Update available</span>
+            <button id="reloadAppBtn" type="button" style="background:#1e1e1e;color:#fff;border:0;border-radius:3px;padding:4px 10px;cursor:pointer;">Reload</button>
+        </div>
+        <div class="main">
       <div class="activity"><button class="icon active" title="Explorer" data-view="explorer">▤</button><button class="icon" title="Search" data-view="search">⌕</button><button class="icon" title="Source" data-view="source">⑂</button><button class="icon" title="Run" data-view="run">▷</button><button class="icon" title="Settings" data-view="settings">⚙</button></div>
       <aside class="sidebar">
         <div id="sideHead" class="side-head">Explorer</div>
@@ -2193,25 +2241,157 @@ APP_HTML = r"""<!doctype html>
       }).join("");
     }
 
-    async function loadWorkspace(data) {
-      data = data || await api("/api/workspace");
-      state.root = data.root;
-      state.baseRoot = data.baseRoot || data.root;
-      state.activeRepo = data.activeRepo || ".";
-      state.tree = data.tree;
-      state.repos = data.repos;
-      state.openFiles = [];
-      state.activeFile = null;
-      state.activeLanguage = "text";
-      state.panels = {};
-      state.lint = null;
-      $("workspacePath").value = data.root;
-      $("activeTab").textContent = "Welcome";
-      $("editor").textContent = "// Open a file from Explorer, then ask bb-code for planning, debug help, or inline hints.";
-      showExplorer();
-      await loadPanel("diagnostics");
-      setStatus(`Workspace ${data.name}`);
-    }
+        function workspaceRecentKey() { return "bb-code:recent-workspaces"; }
+
+        function loadRecentWorkspaces() {
+            try {
+                const value = JSON.parse(localStorage.getItem(workspaceRecentKey()) || "[]");
+                return Array.isArray(value) ? value.filter(item => typeof item === "string" && item.trim()) : [];
+            } catch {
+                return [];
+            }
+        }
+
+        function saveRecentWorkspaces(workspaces) {
+            localStorage.setItem(workspaceRecentKey(), JSON.stringify(workspaces.slice(0, 8)));
+        }
+
+        function rememberWorkspace(path) {
+            if (!path) return;
+            const recent = loadRecentWorkspaces().filter(item => item !== path);
+            recent.unshift(path);
+            saveRecentWorkspaces(recent);
+            renderRecentWorkspaces();
+        }
+
+        function renderRecentWorkspaces() {
+            const select = $("recentWorkspaces");
+            if (!select) return;
+            const recent = loadRecentWorkspaces();
+            select.innerHTML = `<option value="">Recent workspaces</option>${recent.map(path => `<option value="${escapeHtml(path)}">${escapeHtml(path)}</option>`).join("")}`;
+        }
+
+        async function openCurrentFileInEditor() {
+            if (!state.activeFile) {
+                setStatus("No file open");
+                return;
+            }
+            const absolutePath = `${state.root.replace(/\/$/, "")}/${state.activeFile}`;
+            window.open(encodeURI(`vscode://file${absolutePath}`), "_blank", "noopener");
+            setStatus(`Opening ${state.activeFile} in editor`);
+        }
+
+        async function loadWorkspace(data) {
+            data = data || await api("/api/workspace");
+            state.root = data.root;
+            state.baseRoot = data.baseRoot || data.root;
+            state.activeRepo = data.activeRepo || ".";
+            state.tree = data.tree;
+            state.repos = data.repos;
+            state.openFiles = [];
+            state.activeFile = null;
+            state.activeLanguage = "text";
+            state.panels = {};
+            state.lint = null;
+            $("workspacePath").value = data.root;
+            $("cwdDisplay").textContent = data.root;
+            rememberWorkspace(data.root);
+            $("activeTab").textContent = "Welcome";
+            $("editor").textContent = "// Open a file from Explorer, then ask bb-code for planning, debug help, or inline hints.";
+            showExplorer();
+            await loadPanel("diagnostics");
+            setStatus(`Workspace ${data.name}`);
+        }
+
+        let deferredPrompt = null;
+        let waitingServiceWorker = null;
+        const installBtn = $("installBtn");
+        const updateBanner = $("updateBanner");
+        const reloadAppBtn = $("reloadAppBtn");
+        const openEditorBtn = $("openEditorBtn");
+        const recentWorkspaces = $("recentWorkspaces");
+        const openRecentBtn = $("openRecentBtn");
+
+        function showUpdateAvailable() {
+            updateBanner.style.display = "flex";
+        }
+
+        if ("serviceWorker" in navigator) {
+            window.addEventListener("load", async () => {
+                try {
+                    const registration = await navigator.serviceWorker.register("/service-worker.js");
+                    registration.addEventListener("updatefound", () => {
+                        const worker = registration.installing;
+                        if (!worker) return;
+                        waitingServiceWorker = worker;
+                        worker.addEventListener("statechange", () => {
+                            if (worker.state === "installed" && navigator.serviceWorker.controller) {
+                                showUpdateAvailable();
+                            }
+                        });
+                    });
+                } catch (error) {
+                    console.warn("Service worker registration failed", error);
+                }
+            });
+            navigator.serviceWorker.addEventListener("controllerchange", () => window.location.reload());
+        }
+
+        window.addEventListener("beforeinstallprompt", event => {
+            event.preventDefault();
+            deferredPrompt = event;
+            installBtn.style.display = "inline-block";
+        });
+
+        window.addEventListener("appinstalled", () => {
+            deferredPrompt = null;
+            installBtn.style.display = "none";
+        });
+
+        installBtn.addEventListener("click", async () => {
+            if (!deferredPrompt) return;
+            installBtn.disabled = true;
+            deferredPrompt.prompt();
+            const choice = await deferredPrompt.userChoice;
+            if (choice.outcome !== "accepted") {
+                installBtn.disabled = false;
+            } else {
+                installBtn.style.display = "none";
+            }
+            deferredPrompt = null;
+        });
+
+        reloadAppBtn.addEventListener("click", () => {
+            if (waitingServiceWorker) {
+                waitingServiceWorker.postMessage({ type: "SKIP_WAITING" });
+            } else {
+                window.location.reload();
+            }
+        });
+        openEditorBtn.addEventListener("click", openCurrentFileInEditor);
+        openRecentBtn.addEventListener("click", () => {
+            if (recentWorkspaces.value) switchWorkspacePath(recentWorkspaces.value);
+        });
+        recentWorkspaces.addEventListener("change", () => {
+            if (recentWorkspaces.value) switchWorkspacePath(recentWorkspaces.value);
+        });
+
+        async function switchWorkspacePath(path) {
+            if (!path) return;
+            setStatus(`Opening workspace ${path}`);
+            try {
+                const data = await api("/api/workspace", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ path })
+                });
+                await loadWorkspace(data);
+                setStatus(`Workspace ${data.name}`);
+            } catch (error) {
+                setStatus("Workspace error");
+                addMessage("assistant", `Could not open workspace: ${error}`);
+            }
+        }
 
     async function switchRepo(path) {
       setStatus(`Opening repo ${path}`);
@@ -2919,6 +3099,25 @@ APP_HTML = r"""<!doctype html>
     $("prompt").addEventListener("keydown", event => {
       if ((event.metaKey || event.ctrlKey) && event.key === "Enter") sendMessage();
     });
+        document.addEventListener("keydown", event => {
+            if (!(event.metaKey || event.ctrlKey)) return;
+            const key = event.key.toLowerCase();
+            if (key === "o") {
+                event.preventDefault();
+                $("workspacePath").focus();
+            } else if (key === "e") {
+                event.preventDefault();
+                openCurrentFileInEditor();
+            } else if (key === "r") {
+                event.preventDefault();
+                loadPanel("diagnostics");
+            } else if (key === "enter" && document.activeElement !== $("prompt")) {
+                event.preventDefault();
+                sendMessage();
+            }
+        });
+
+        renderRecentWorkspaces();
 
     loadWorkspace().catch(err => {
       $("editor").textContent = String(err);
