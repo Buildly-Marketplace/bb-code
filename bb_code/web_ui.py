@@ -18,6 +18,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+import urllib.request
+import urllib.error
 from urllib.parse import parse_qs, urlparse
 
 from .diagnostics import SelfDiagnosticEngine
@@ -65,6 +67,8 @@ REPORTS_DIR = "reports"
 K8S_MONITOR_RELATIVE_PATH = Path("integrations") / "k8s-monitor"
 K8S_MONITOR_REPO_URL = "https://github.com/Buildly-Marketplace/k8s-monitor"
 K8S_MONITOR_DEFAULT_URL = "http://127.0.0.1:8000/"
+_k8s_monitor_proc: subprocess.Popen | None = None
+_k8s_monitor_lock = threading.Lock()
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 LOGO_PATH = Path(__file__).resolve().parents[1] / "forge-logo.png"
 
@@ -326,7 +330,55 @@ def k8s_monitor_integration_status(app_root: Path | None = None) -> dict[str, An
     status["commit"] = _git_value(path, ["rev-parse", "--short", "HEAD"])
     status["branch"] = _git_value(path, ["rev-parse", "--abbrev-ref", "HEAD"])
     status["healthUrl"] = K8S_MONITOR_DEFAULT_URL.rstrip("/") + "/health"
+    status["running"] = _k8s_monitor_health_check(status["healthUrl"])
     return status
+
+
+def _k8s_monitor_health_check(url: str, timeout: float = 2.0) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def start_k8s_monitor(app_root: Path | None = None) -> dict[str, Any]:
+    global _k8s_monitor_proc
+    root = app_root or application_root()
+    path = root / K8S_MONITOR_RELATIVE_PATH
+    if not (path / "main.py").exists():
+        return {"started": False, "error": "k8s-monitor is not installed"}
+    with _k8s_monitor_lock:
+        if _k8s_monitor_proc is not None and _k8s_monitor_proc.poll() is None:
+            return {"started": True, "already_running": True, "dashboardUrl": K8S_MONITOR_DEFAULT_URL}
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "main.py"],
+                cwd=str(path),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            return {"started": False, "error": str(exc)}
+        _k8s_monitor_proc = proc
+    return {"started": True, "pid": proc.pid, "dashboardUrl": K8S_MONITOR_DEFAULT_URL}
+
+
+def stop_k8s_monitor() -> dict[str, Any]:
+    global _k8s_monitor_proc
+    with _k8s_monitor_lock:
+        if _k8s_monitor_proc is None or _k8s_monitor_proc.poll() is not None:
+            _k8s_monitor_proc = None
+            return {"stopped": True, "was_running": False}
+        pid = _k8s_monitor_proc.pid
+        _k8s_monitor_proc.terminate()
+        try:
+            _k8s_monitor_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _k8s_monitor_proc.kill()
+            _k8s_monitor_proc.wait()
+        _k8s_monitor_proc = None
+    return {"stopped": True, "pid": pid}
 
 
 def _git_value(path: Path, args: list[str]) -> str:
@@ -896,42 +948,41 @@ def build_agent_prompt(root: Path, message: str, mode: str, open_files: list[str
         "agent": "Act as an approval-gated coding agent: propose concrete multi-file changes and explain what each change fixes.",
     }.get(mode, "Help the user safely understand and improve the codebase.")
 
-    return f"""You are bb-code inside a VS Code-like local web UI.
+    return f"""You are bb-code, a coding assistant embedded directly in a local web IDE with live filesystem access.
 
-Safety rules:
-- Do not claim that you edited files.
-- Do not propose background daemons or autonomous loops.
-- For code changes, provide reviewable suggestions or patch-style snippets.
-- In Agent mode, be specific about which files should change and why.
-- Reply to the chat in plain text only. Do not wrap the main chat response in JSON or Markdown fences.
-- You can read and reason about the file contents included below. Do not say you cannot access them.
-- If a user asks about an opened file, use the provided file contents directly.
-- Never apologize that you cannot access external files when the relevant file contents are already included below.
-- Ask for user approval before any destructive or broad change.
-- Explain the Buildly way: Python-first, Docker-first local setup, no Makefiles, ops/startup.sh when relevant, devdocs updates, minimal useful tests.
-- Handle cloud native apps by considering Docker, services, env vars, health checks, and deployment boundaries.
-- Treat the Explorer context as authoritative. If it lists folders or repos, they exist even when the generic repository scan says no standard files were found.
-- In multi-repo or microservice workspaces, treat top-level folders as candidate services and inspect/ask for the relevant service files before proposing new scaffolding.
-- If the user names a service such as buildly-core, focus on that existing service instead of suggesting a new empty app structure.
+## FILESYSTEM & WORKING DIRECTORY
+Current working directory: {root}
 
-Mode: {mode}
-Mode instruction: {mode_instruction}
+The Explorer context below IS the live filesystem view captured from disk right now.
+Do NOT say you cannot see the filesystem or directory structure — you can. Use the data below.
+Do NOT say you "do not have a file system view" — the file tree is provided in full.
+If a path or file is listed in the Explorer context, it exists on disk.
 
-Workspace context:
-{context}
-
-Explorer context:
 {explorer_context}
 
-Cloud-native service inventory:
-```json
+## OPEN FILES (full content)
+{chr(10).join(files) if files else "No files are currently open."}
+
+## REPOSITORY SUMMARY
+{context}
+
+## CLOUD-NATIVE INVENTORY
 {json.dumps(cloud_inventory, indent=2)}
-```
 
-Open files:
-{chr(10).join(files) if files else "No files opened."}
+## DIRECTIVES
+- Mode: {mode}
+- {mode_instruction}
+- Never claim you cannot access files whose content is included above.
+- Never apologize for lacking filesystem access — you have it through the context above.
+- Do not claim that you edited files; provide reviewable suggestions or patch-style snippets instead.
+- Do not propose background daemons or autonomous loops.
+- In Agent mode, name the specific files that should change and explain why.
+- Ask for user approval before any destructive or broad change.
+- Follow the Buildly way: Python-first, Docker-first, ops/startup.sh, no Makefiles, devdocs updates, minimal useful tests.
+- For multi-repo or microservice workspaces, treat each top-level folder as a candidate service.
+- If the user names an existing service, focus on it rather than scaffolding a new one.
 
-User message:
+## USER MESSAGE
 {message}
 """
 
@@ -1798,6 +1849,10 @@ def _make_handler(session: WorkspaceSession) -> type[BaseHTTPRequestHandler]:
                     self._send_json(kubectl_diagnostics(root))
                 elif parsed.path == "/api/platform-report":
                     self._send_json(generate_platform_report(root, session.settings_root))
+                elif parsed.path == "/api/integrations/k8s-monitor/start":
+                    self._send_json(start_k8s_monitor(application_root()))
+                elif parsed.path == "/api/integrations/k8s-monitor/stop":
+                    self._send_json(stop_k8s_monitor())
                 else:
                     self.send_error(HTTPStatus.NOT_FOUND)
             except FileNotFoundError:
@@ -2147,7 +2202,20 @@ APP_HTML = r"""<!doctype html>
     .messages { overflow-y: auto; min-height: 0; max-height: 100%; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
     .msg { border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; white-space: pre-wrap; }
     .user { background: #12324a; }
-    .assistant { background: #262626; }
+    .assistant { background: #262626; white-space: normal; }
+    .assistant h3,.assistant h4,.assistant h5 { margin: 10px 0 4px; color: #e0e0e0; font-weight: 600; }
+    .assistant h3 { font-size: 14px; }
+    .assistant h4 { font-size: 13px; }
+    .assistant h5 { font-size: 12px; color: var(--muted); }
+    .assistant p { margin: 4px 0; line-height: 1.55; }
+    .assistant ul,.assistant ol { margin: 4px 0 4px 18px; padding: 0; line-height: 1.55; }
+    .assistant li { margin: 2px 0; }
+    .assistant code { background: #1a1a1a; border: 1px solid #3c3c3c; border-radius: 3px; padding: 1px 4px; font: 12px/1.4 "SFMono-Regular",Consolas,Menlo,monospace; color: #ce9178; }
+    .assistant pre { background: #1a1a1a; border: 1px solid #3c3c3c; border-radius: 4px; padding: 10px 12px; overflow-x: auto; margin: 6px 0; }
+    .assistant pre code { background: none; border: none; padding: 0; color: #d4d4d4; font-size: 12px; }
+    .assistant hr { border: none; border-top: 1px solid var(--line); margin: 8px 0; }
+    .assistant strong { color: #e8e8e8; font-weight: 600; }
+    .assistant em { color: #c8c8c8; }
     .loading { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
     .spinner { width: 12px; height: 12px; border: 2px solid #555; border-top-color: var(--blue); border-radius: 50%; animation: spin .8s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
@@ -2663,7 +2731,30 @@ APP_HTML = r"""<!doctype html>
         const data = await api("/api/integrations/k8s-monitor");
         $("tree").innerHTML = renderK8sMonitorSummary(data);
         $("panelBody").innerHTML = renderK8sMonitorPanel(data);
-        setStatus(data.installed ? "K8s monitor installed" : "K8s monitor not installed");
+        setStatus(data.running ? "K8s monitor running" : data.installed ? "K8s monitor installed (not running)" : "K8s monitor not installed");
+        if (data.installed) {
+          const startBtn = document.getElementById("k8sStartBtn");
+          const stopBtn = document.getElementById("k8sStopBtn");
+          if (startBtn) startBtn.addEventListener("click", async () => {
+            setStatus("Starting k8s-monitor...");
+            startBtn.disabled = true;
+            const result = await api("/api/integrations/k8s-monitor/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+            if (result.started) {
+              await new Promise(r => setTimeout(r, 2500));
+              showK8sMonitor();
+            } else {
+              setStatus("Start failed: " + (result.error || "unknown error"));
+              startBtn.disabled = false;
+            }
+          });
+          if (stopBtn) stopBtn.addEventListener("click", async () => {
+            setStatus("Stopping k8s-monitor...");
+            stopBtn.disabled = true;
+            await api("/api/integrations/k8s-monitor/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+            await new Promise(r => setTimeout(r, 800));
+            showK8sMonitor();
+          });
+        }
       } catch (error) {
         $("tree").innerHTML = `<div class="muted" style="padding:8px">K8s monitor check failed.</div>`;
         $("panelBody").textContent = `K8s monitor check failed: ${error}`;
@@ -2675,18 +2766,32 @@ APP_HTML = r"""<!doctype html>
       const lines = [
         data.name || "ForgeOps / k8s-monitor",
         `installed: ${data.installed ? "yes" : "no"}`,
+        data.installed ? `running: ${data.running ? "yes" : "no"}` : "",
         `path: ${data.path || "integrations/k8s-monitor"}`,
         data.commit ? `commit: ${data.commit}` : "",
         data.branch ? `branch: ${data.branch}` : ""
       ].filter(Boolean).join("\n");
-      const links = data.installed
-        ? `<div class="report-links"><a href="${escapeHtml(data.dashboardUrl)}" target="_blank" rel="noopener">Open ForgeOps dashboard</a><a href="${escapeHtml(data.docsUrl)}" target="_blank" rel="noopener">ForgeOps docs</a></div>`
-        : "";
-      return `<pre style="background:transparent;padding:8px;color:#d4d4d4">${escapeHtml(lines)}</pre>${links}`;
+      let controls = "";
+      if (data.installed) {
+        const startBtn = `<button id="k8sStartBtn" class="small"${data.running ? " disabled" : ""}>Start</button>`;
+        const stopBtn = `<button id="k8sStopBtn" class="small"${!data.running ? " disabled" : ""}>Stop</button>`;
+        const openLink = data.running
+          ? `<a href="${escapeHtml(data.dashboardUrl)}" target="_blank" rel="noopener">Open dashboard</a>`
+          : "";
+        const docsLink = `<a href="${escapeHtml(data.docsUrl)}" target="_blank" rel="noopener">Docs</a>`;
+        controls = `<div class="report-links">${startBtn}${stopBtn}${openLink}${docsLink}</div>`;
+      }
+      return `<pre style="background:transparent;padding:8px;color:#d4d4d4">${escapeHtml(lines)}</pre>${controls}`;
     }
 
     function renderK8sMonitorPanel(data) {
-      const startCommands = (data.startCommands || []).map(command => `- ${command}`).join("\n");
+      if (data.running) {
+        return `<div style="display:flex;flex-direction:column;height:100%;gap:8px;padding:8px">
+          <div style="color:#d4d4d4;font-size:13px">ForgeOps dashboard — <a href="${escapeHtml(data.dashboardUrl)}" target="_blank" rel="noopener" style="color:#4fc3f7">open in new tab</a></div>
+          <iframe src="${escapeHtml(data.dashboardUrl)}" style="flex:1;width:100%;border:1px solid #3c3c3c;border-radius:4px;background:#1e1e1e" title="ForgeOps k8s-monitor dashboard"></iframe>
+        </div>`;
+      }
+      const startCommands = (data.startCommands || []).map(cmd => `- ${cmd}`).join("\n");
       const notes = (data.notes || []).map(note => `- ${note}`).join("\n");
       const markdown = [
         "# ForgeOps / k8s-monitor Integration",
@@ -2844,7 +2949,11 @@ APP_HTML = r"""<!doctype html>
     function addMessage(role, text) {
       const div = document.createElement("div");
       div.className = `msg ${role}`;
-      div.textContent = text;
+      if (role === "assistant") {
+        div.innerHTML = renderMarkdown(text);
+      } else {
+        div.textContent = text;
+      }
       $("messages").appendChild(div);
       $("messages").scrollTop = $("messages").scrollHeight;
     }
@@ -3022,6 +3131,47 @@ APP_HTML = r"""<!doctype html>
     function setStatus(text) { $("status").textContent = text; }
     function escapeHtml(value) {
       return String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[char]));
+    }
+
+    function renderMarkdown(text) {
+      // Replace fenced code blocks first to protect them from inline rules
+      const blocks = [];
+      let s = String(text).replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+        const idx = blocks.length;
+        blocks.push(`<pre><code>${escapeHtml(code.replace(/\n$/, ""))}</code></pre>`);
+        return `\x00BLOCK${idx}\x00`;
+      });
+      // Escape remaining HTML
+      s = s.replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[char]));
+      // Restore code blocks (already escaped inside)
+      s = s.replace(/\x00BLOCK(\d+)\x00/g, (_, i) => blocks[parseInt(i)]);
+      // Inline code
+      s = s.replace(/`([^`\n]+?)`/g, (_, c) => `<code>${escapeHtml(c)}</code>`);
+      // Bold and italic
+      s = s.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
+      s = s.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+      s = s.replace(/\*([^*\n]+?)\*/g, "<em>$1</em>");
+      // Headers
+      s = s.replace(/^### (.+)$/gm, "<h5>$1</h5>");
+      s = s.replace(/^## (.+)$/gm, "<h4>$1</h4>");
+      s = s.replace(/^# (.+)$/gm, "<h3>$1</h3>");
+      // Horizontal rules
+      s = s.replace(/^---+$/gm, "<hr>");
+      // Lists — collect consecutive list lines into ul/ol
+      s = s.replace(/((?:^[ \t]*[-*] .+\n?)+)/gm, match =>
+        "<ul>" + match.replace(/^[ \t]*[-*] (.+)$/gm, "<li>$1</li>") + "</ul>");
+      s = s.replace(/((?:^[ \t]*\d+\. .+\n?)+)/gm, match =>
+        "<ol>" + match.replace(/^[ \t]*\d+\. (.+)$/gm, "<li>$1</li>") + "</ol>");
+      // Paragraphs: blank lines → paragraph breaks
+      s = s.replace(/\n{2,}/g, "</p><p>");
+      s = "<p>" + s + "</p>";
+      // Clean up empty paragraphs and paragraphs wrapping block elements
+      s = s.replace(/<p>\s*(<(?:h[3-5]|ul|ol|pre|hr)[^>]*>)/g, "$1");
+      s = s.replace(/(<\/(?:h[3-5]|ul|ol|pre|hr)>)\s*<\/p>/g, "$1");
+      s = s.replace(/<p>\s*<\/p>/g, "");
+      // Single newlines → <br> inside paragraphs
+      s = s.replace(/([^>])\n([^<])/g, "$1<br>$2");
+      return s;
     }
 
     function highlightCode(value, language) {
