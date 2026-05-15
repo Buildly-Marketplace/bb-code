@@ -967,14 +967,18 @@ If a path or file is listed in the Explorer context, it exists on disk.
 {context}
 
 ## CLOUD-NATIVE INVENTORY
+Cloud-native service inventory:
 {json.dumps(cloud_inventory, indent=2)}
 
 ## DIRECTIVES
 - Mode: {mode}
 - {mode_instruction}
+- Treat the Explorer context as authoritative.
 - Never claim you cannot access files whose content is included above.
+- Do not say you cannot access them.
 - Never apologize for lacking filesystem access — you have it through the context above.
-- Do not claim that you edited files; provide reviewable suggestions or patch-style snippets instead.
+- Do not claim that you edited files unless the system explicitly confirms apply success.
+- In Agent mode, provide machine-applicable edits when feasible so the UI can apply them with approval.
 - Do not propose background daemons or autonomous loops.
 - In Agent mode, name the specific files that should change and explain why.
 - Ask for user approval before any destructive or broad change.
@@ -1021,6 +1025,8 @@ def build_edit_suggestion_prompt(root: Path, message: str, open_files: list[str]
             continue
         files.append(f"### {file_data['path']}\n```{file_data['language']}\n{file_data['content']}\n```")
 
+    explorer_context = build_explorer_context(root)
+
     return f"""You are bb-code preparing approval-gated file edits.
 
 Return JSON only. No Markdown. No prose outside JSON.
@@ -1039,13 +1045,17 @@ Schema:
 }}
 
 Rules:
-- Only suggest edits for files included below.
+- Only suggest edits for files that exist in the workspace shown below.
+- Prefer using currently open files when they are relevant to the request.
 - Prefer exact find/replace edits for small changes.
 - For insertions, use "find" as the nearby exact text and "replace" as that same text plus the insertion.
 - If a full file rewrite is truly needed, use "content" with the full replacement file content.
 - Keep changes minimal and directly related to the user request.
 - Do not include destructive changes.
 - If no safe edit is possible, return {{"edits": [], "notes": ["reason"]}}.
+
+Workspace Explorer context:
+{explorer_context}
 
 User request:
 {message}
@@ -1079,6 +1089,14 @@ def chat_with_model(root: Path, payload: dict[str, Any], settings_root: Path | N
         try:
             edit_response = client.generate(edit_prompt)
             edits = parse_edit_suggestions(root, edit_response)
+            if not edits:
+                retry_prompt = (
+                    "Convert the following draft into the exact JSON schema requested earlier. "
+                    "Return JSON only, no markdown, no prose.\n\n"
+                    f"Draft response:\n{response}\n"
+                )
+                retry_response = client.generate(retry_prompt)
+                edits = parse_edit_suggestions(root, retry_response)
         except ModelError:
             edits = []
     return {"role": "assistant", "content": response, "edits": edits}
@@ -2137,7 +2155,7 @@ APP_HTML = r"""<!doctype html>
     .activity { background: #333333; border-right: 1px solid #1b1b1b; display: flex; flex-direction: column; align-items: center; padding-top: 8px; gap: 8px; }
     .icon { width: 34px; height: 34px; border: 0; color: #ccc; background: transparent; border-radius: 4px; font-size: 17px; cursor: pointer; }
     .icon.active, .icon:hover { background: #424242; color: white; }
-    .sidebar { background: var(--panel); border-right: 1px solid var(--line); min-width: 0; display: grid; grid-template-rows: auto auto 1fr; }
+    .sidebar { background: var(--panel); border-right: 1px solid var(--line); min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-rows: auto auto minmax(0, 1fr); }
     .side-head { padding: 10px 12px 8px; text-transform: uppercase; font-size: 11px; color: #bbbbbb; letter-spacing: .4px; }
     .repo-list { border-bottom: 1px solid var(--line); padding: 0 8px 8px; color: var(--muted); }
     .repo-button {
@@ -2145,7 +2163,7 @@ APP_HTML = r"""<!doctype html>
       padding: 4px 6px; cursor: pointer; font: inherit;
     }
     .repo-button:hover, .repo-button.active { background: #37373d; color: white; }
-    .tree { overflow: auto; padding: 4px 4px 20px; }
+    .tree { min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 4px 4px 20px; }
     .side-tool { padding: 8px; border-bottom: 1px solid var(--line); display: grid; gap: 8px; }
     .side-tool input {
       width: 100%; background: #1b1b1b; color: var(--text); border: 1px solid var(--line);
@@ -2281,8 +2299,8 @@ APP_HTML = r"""<!doctype html>
           <div id="panelBody" class="panel-body">Loading diagnostics...</div>
         </div>
       </section>
-      <aside class="chat">
-        <div class="chat-head"><strong>Agent Chat</strong><span class="muted">approval-gated</span></div>
+            <aside class="chat">
+                <div class="chat-head"><strong>Agent Chat</strong><div style="display:flex;align-items:center;gap:10px"><label style="display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;cursor:pointer"><input id="autoApplyToggle" type="checkbox" />Auto-apply</label><span id="approvalBadge" class="muted">approval-gated</span></div></div>
         <div class="modebar"><button class="active" data-mode="agent">Agent</button><button data-mode="plan">Plan</button><button data-mode="debug">Debug</button><button data-mode="hints">Hints</button></div>
         <div id="messages" class="messages"><div class="msg assistant">I can inspect multiple files, explain the Buildly way, plan changes, debug errors, and suggest inline hints. I will not silently edit files.</div></div>
         <div class="composer"><textarea id="prompt" placeholder="Ask about this workspace..."></textarea><button id="send" class="send">Send</button></div>
@@ -2291,7 +2309,25 @@ APP_HTML = r"""<!doctype html>
     <div class="status"><span id="status">Ready</span><span>Local web UI</span><span>No silent edits</span></div>
   </div>
   <script>
-    const state = { root: "", baseRoot: "", activeRepo: ".", openFiles: [], activeFile: null, activeLanguage: "text", mode: "agent", panels: {}, tree: [], repos: [], lint: null, settings: null };
+        function autoApplyPreferenceKey() { return "bb-code:auto-apply-edits"; }
+
+        function loadAutoApplyPreference() {
+            try {
+                return localStorage.getItem(autoApplyPreferenceKey()) === "1";
+            } catch {
+                return false;
+            }
+        }
+
+        function saveAutoApplyPreference(enabled) {
+            try {
+                localStorage.setItem(autoApplyPreferenceKey(), enabled ? "1" : "0");
+            } catch {
+                return;
+            }
+        }
+
+        const state = { root: "", baseRoot: "", activeRepo: ".", openFiles: [], activeFile: null, activeLanguage: "text", mode: "agent", panels: {}, tree: [], repos: [], lint: null, settings: null, autoApplyEdits: loadAutoApplyPreference() };
     const $ = (id) => document.getElementById(id);
 
     async function api(path, options) {
@@ -2303,8 +2339,10 @@ APP_HTML = r"""<!doctype html>
     function renderTree(nodes, depth = 0) {
       return nodes.map(node => {
         const pad = `padding-left:${8 + depth * 12}px`;
-        const label = node.type === "dir" ? `${node.collapsed ? "▸" : "▾"} ${node.name}` : `  ${node.name}`;
-        const row = `<div class="node ${node.type}" style="${pad}" data-path="${node.path}" data-type="${node.type}">${label}</div>`;
+                const safeName = escapeHtml(node.name);
+                const safePath = escapeHtml(node.path);
+                const label = node.type === "dir" ? `${node.collapsed ? "▸" : "▾"} ${safeName}` : `  ${safeName}`;
+                const row = `<div class="node ${node.type}" style="${pad}" data-path="${safePath}" data-type="${node.type}">${label}</div>`;
         return row + (node.children && !node.collapsed ? renderTree(node.children, depth + 1) : "");
       }).join("");
     }
@@ -2437,6 +2475,17 @@ APP_HTML = r"""<!doctype html>
             }
         });
         openEditorBtn.addEventListener("click", openCurrentFileInEditor);
+        const autoApplyToggle = $("autoApplyToggle");
+        if (autoApplyToggle) {
+            autoApplyToggle.checked = state.autoApplyEdits;
+            autoApplyToggle.addEventListener("change", () => {
+                state.autoApplyEdits = autoApplyToggle.checked;
+                saveAutoApplyPreference(state.autoApplyEdits);
+                updateApprovalBadge();
+                setStatus(state.autoApplyEdits ? "Auto-apply enabled" : "Approval-gated mode");
+            });
+        }
+        updateApprovalBadge();
         openRecentBtn.addEventListener("click", () => {
             if (recentWorkspaces.value) switchWorkspacePath(recentWorkspaces.value);
         });
@@ -2775,8 +2824,8 @@ APP_HTML = r"""<!doctype html>
       if (data.installed) {
         const startBtn = `<button id="k8sStartBtn" class="small"${data.running ? " disabled" : ""}>Start</button>`;
         const stopBtn = `<button id="k8sStopBtn" class="small"${!data.running ? " disabled" : ""}>Stop</button>`;
-        const openLink = data.running
-          ? `<a href="${escapeHtml(data.dashboardUrl)}" target="_blank" rel="noopener">Open dashboard</a>`
+                const openLink = data.running
+                    ? `<a href="${escapeHtml(data.dashboardUrl)}" target="_blank" rel="noopener">Open ForgeOps dashboard</a>`
           : "";
         const docsLink = `<a href="${escapeHtml(data.docsUrl)}" target="_blank" rel="noopener">Docs</a>`;
         controls = `<div class="report-links">${startBtn}${stopBtn}${openLink}${docsLink}</div>`;
@@ -2973,7 +3022,13 @@ APP_HTML = r"""<!doctype html>
         });
         loading.remove();
         addMessage("assistant", response.content);
-        if (response.edits && response.edits.length) addEditSuggestions(response.edits);
+                if (response.edits && response.edits.length) {
+                    if (state.autoApplyEdits) {
+                        await applyEditsDirect(response.edits);
+                    } else {
+                        addEditSuggestions(response.edits);
+                    }
+                }
         setStatus("Ready");
       } catch (error) {
         loading.remove();
@@ -2981,6 +3036,57 @@ APP_HTML = r"""<!doctype html>
         setStatus("Error");
       }
     }
+
+        async function applyEditsDirect(edits) {
+            if (!edits || !edits.length) return;
+            addMessage("assistant", `Auto-apply is enabled. Applying ${edits.length} change${edits.length !== 1 ? "s" : ""} now.`);
+            let applied = 0;
+            let lastAppliedPath = null;
+            const failures = [];
+
+            for (const edit of edits) {
+                try {
+                    await api("/api/apply-edit", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ path: edit.path, content: edit.content })
+                    });
+                    applied += 1;
+                    lastAppliedPath = edit.path;
+                } catch (error) {
+                    failures.push(`${edit.path}: ${String(error)}`);
+                }
+            }
+
+            if (lastAppliedPath) {
+                try {
+                    await openFile(lastAppliedPath);
+                } catch {
+                    // Keep summary messaging even if refreshing the last file fails.
+                }
+            }
+
+            if (!failures.length) {
+                addMessage("assistant", `Applied ${applied} change${applied !== 1 ? "s" : ""} automatically.`);
+                setStatus(`Applied ${applied} change${applied !== 1 ? "s" : ""}`);
+                return;
+            }
+
+            addMessage("assistant", `Applied ${applied} change${applied !== 1 ? "s" : ""}. Failed ${failures.length}.\n${failures.slice(0, 5).join("\n")}`);
+            setStatus(`Auto-apply completed with ${failures.length} failure${failures.length !== 1 ? "s" : ""}`);
+        }
+
+        function updateApprovalBadge() {
+            const badge = $("approvalBadge");
+            if (!badge) return;
+            if (state.autoApplyEdits) {
+                badge.textContent = "auto-apply enabled";
+                badge.style.color = "var(--yellow)";
+            } else {
+                badge.textContent = "approval-gated";
+                badge.style.color = "var(--muted)";
+            }
+        }
 
     function addLoadingMessage() {
       const div = document.createElement("div");
@@ -3061,10 +3167,12 @@ APP_HTML = r"""<!doctype html>
         card.querySelector(".approve-btn").disabled = true;
         card.querySelector(".skip-btn").disabled = true;
         await openFile(edit.path);
+                addMessage("assistant", `Applied change to ${edit.path}.`);
         setStatus(`Applied ${edit.path}`);
       } catch (err) {
         statusEl.textContent = "error";
         statusEl.style.color = "var(--red)";
+                addMessage("assistant", `Failed to apply ${edit.path}: ${String(err)}`);
         setStatus(`Failed to apply ${edit.path}`);
       }
     }

@@ -78,6 +78,11 @@ def test_app_html_exposes_platform_report() -> None:
     assert "/reports?path=" in APP_HTML
 
 
+def test_app_html_exposes_auto_apply_toggle() -> None:
+    assert "autoApplyToggle" in APP_HTML
+    assert "Auto-apply" in APP_HTML
+
+
 def test_workspace_session_switches_active_root(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
