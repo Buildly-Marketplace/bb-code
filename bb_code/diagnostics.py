@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from .model_router import ModelError, OllamaClient
+from .model_router import ModelError, OllamaClient, SUPPORTED_PROVIDERS
 from .repo_context import scan_repository
 from .settings import AgentSettings, settings_path
 from .utils import context_path, ensure_bb_dirs, relative
@@ -66,19 +66,20 @@ class SelfDiagnosticEngine:
             self._check_repository_shape(),
             self._check_pytest_available(),
         ]
-        if check_model and self.settings.provider == "ollama":
-            results.append(self._check_ollama())
-        elif self.settings.provider == "openai-compatible":
-            results.append(self._check_remote_api_settings())
-        elif self.settings.provider != "ollama":
-            results.append(
-                DiagnosticResult(
-                    "AI provider",
-                    "warn",
-                    f"Provider `{self.settings.provider}` is not supported.",
-                    "Use `ollama` or `openai-compatible`.",
+        if check_model:
+            if self.settings.provider == "ollama":
+                results.append(self._check_ollama())
+            elif self.settings.provider in SUPPORTED_PROVIDERS:
+                results.append(self._check_remote_api_settings())
+            else:
+                results.append(
+                    DiagnosticResult(
+                        "AI provider",
+                        "warn",
+                        f"Provider `{self.settings.provider}` is not supported.",
+                        f"Use one of: {', '.join(SUPPORTED_PROVIDERS)}.",
+                    )
                 )
-            )
         return DiagnosticReport(results=results, error_context=error_context)
 
     def apply_safe_repair(self, repair_key: str) -> DiagnosticResult:
@@ -217,22 +218,23 @@ class SelfDiagnosticEngine:
         )
 
     def _check_remote_api_settings(self) -> DiagnosticResult:
-        if not self.settings.api_base_url:
+        config = self.settings.provider_config()
+        if not config.base_url:
             return DiagnosticResult(
                 "Remote AI provider",
                 "fail",
-                "OpenAI-compatible provider is selected without an API base URL.",
+                f"Provider `{config.provider}` is selected without an API base URL.",
                 "Set the remote API base URL in settings.",
             )
-        if not os.getenv(self.settings.api_key_env_var):
+        if config.api_key_env_var and not os.getenv(config.api_key_env_var):
             return DiagnosticResult(
                 "Remote AI provider",
                 "warn",
-                f"API key environment variable `{self.settings.api_key_env_var}` is not set.",
+                f"API key environment variable `{config.api_key_env_var}` is not set.",
                 "Export the API key before using remote model calls.",
             )
         return DiagnosticResult(
             "Remote AI provider",
             "pass",
-            f"Remote API settings are configured for {self.settings.api_base_url}.",
+            f"Remote API settings are configured for {config.base_url}.",
         )

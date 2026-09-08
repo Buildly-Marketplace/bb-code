@@ -4,7 +4,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from bb_code import cli
+from bb_code import cli, model_router
 
 
 runner = CliRunner()
@@ -79,7 +79,7 @@ Add login.
 - Which auth provider?
 """
 
-    monkeypatch.setattr(cli, "OllamaClient", FakeClient)
+    monkeypatch.setattr(model_router, "OllamaClient", FakeClient)
 
     result = runner.invoke(cli.app, ["plan", "Add login system"], catch_exceptions=False)
 
@@ -99,7 +99,7 @@ def test_plan_handles_ollama_not_running(tmp_path: Path, monkeypatch) -> None:
         def generate(self, prompt: str) -> str:
             raise cli.OllamaNotRunningError("offline")
 
-    monkeypatch.setattr(cli, "OllamaClient", BrokenClient)
+    monkeypatch.setattr(model_router, "OllamaClient", BrokenClient)
 
     result = runner.invoke(cli.app, ["plan", "Add login system"])
 
@@ -117,7 +117,7 @@ def test_plan_handles_missing_model(tmp_path: Path, monkeypatch) -> None:
         def generate(self, prompt: str) -> str:
             raise cli.ModelNotFoundError("missing")
 
-    monkeypatch.setattr(cli, "OllamaClient", MissingModelClient)
+    monkeypatch.setattr(model_router, "OllamaClient", MissingModelClient)
 
     result = runner.invoke(cli.app, ["plan", "Add login system", "--model", "missing:model"])
 
@@ -136,7 +136,7 @@ def test_plan_handles_model_timeout(tmp_path: Path, monkeypatch) -> None:
         def generate(self, prompt: str) -> str:
             raise cli.ModelTimeoutError(f"timed out after {self.timeout_seconds}")
 
-    monkeypatch.setattr(cli, "OllamaClient", TimeoutClient)
+    monkeypatch.setattr(model_router, "OllamaClient", TimeoutClient)
 
     result = runner.invoke(cli.app, ["plan", "Add login system", "--timeout", "1"])
 

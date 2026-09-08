@@ -3,8 +3,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .model_router import OllamaClient
+from .model_router import AnthropicClient, OllamaClient, OpenAICompatibleClient
 from .utils import plans_path, slugify
+
+ModelClient = OllamaClient | OpenAICompatibleClient | AnthropicClient
 
 
 MANDATORY_SECTIONS = (
@@ -68,7 +70,7 @@ def create_plan(
     repo_root: Path,
     task_description: str,
     context_markdown: str,
-    client: OllamaClient,
+    client: ModelClient,
 ) -> Path:
     prompt = build_planning_prompt(task_description, context_markdown)
     plan_markdown = client.generate(prompt)

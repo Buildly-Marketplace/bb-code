@@ -23,10 +23,38 @@ import urllib.error
 from urllib.parse import parse_qs, urlparse
 
 from .diagnostics import SelfDiagnosticEngine
-from .model_router import ModelError, OllamaClient, OpenAICompatibleClient
+from .model_router import (
+    SUPPORTED_PROVIDERS,
+    AnthropicClient,
+    ModelError,
+    OllamaClient,
+    OpenAICompatibleClient,
+    create_client,
+)
+from .planner import create_plan
 from .repo_context import scan_repository
-from .settings import AgentSettings, load_settings, resolve_settings, save_settings
-from .utils import BB_DIR, ensure_bb_dirs, read_text_safely, relative
+from .settings import WORK_MODES, AgentSettings, load_settings, resolve_settings, save_settings
+from .utils import BB_DIR, context_path, ensure_bb_dirs, read_text_safely, relative
+
+# Providers considered capable enough that a failed edit shouldn't trigger an
+# "escalate to a bigger model" suggestion for that mode.
+STRONG_PROVIDERS = {"openai", "anthropic"}
+PROVIDER_DISPLAY_NAMES = {
+    "ollama": "Ollama (local)",
+    "openai-compatible": "your OpenAI-compatible endpoint (e.g. Hermes)",
+    "openai": "OpenAI (ChatGPT)",
+    "anthropic": "Anthropic (Claude)",
+}
+
+_KEYWORD_STOPWORDS = {
+    "this", "that", "with", "from", "have", "will", "should", "would", "could",
+    "about", "into", "your", "file", "files", "code", "need", "needs", "please",
+    "make", "using", "when", "where", "which", "there", "their", "they", "them",
+    "then", "also", "just", "like", "some", "does", "function", "method", "class",
+    "import", "return", "self", "true", "false", "none", "and", "the", "for",
+    "are", "was", "were", "been", "being", "def", "use", "can", "add", "fix",
+    "update", "want", "instead", "these", "those", "each", "more", "than",
+}
 
 
 SKIP_DIRS = {
@@ -503,6 +531,41 @@ def search_workspace(root: Path, query: str, max_results: int = 80) -> dict[str,
     return {"results": results}
 
 
+def _extract_keywords(message: str, limit: int = 5) -> list[str]:
+    words = re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", message)
+    keywords: list[str] = []
+    for word in words:
+        lower = word.lower()
+        if lower in _KEYWORD_STOPWORDS or lower in keywords:
+            continue
+        keywords.append(lower)
+        if len(keywords) >= limit:
+            break
+    return keywords
+
+
+def select_candidate_files(root: Path, message: str, open_files: list[str], limit: int = 8) -> list[str]:
+    """Files bb-code should read in full for an Agent-mode request.
+
+    Starts from whatever the user has open (most authoritative), then fills in
+    with files discovered by searching the repo for keywords in the request, so
+    the agent isn't limited to only files someone happened to have open already.
+    """
+    candidates = [path for path in open_files if path]
+    scores: dict[str, int] = {}
+    for keyword in _extract_keywords(message):
+        for hit in search_workspace(root, keyword, max_results=25).get("results", []):
+            path = hit.get("path")
+            if path:
+                scores[path] = scores.get(path, 0) + 1
+    for path, _hits in sorted(scores.items(), key=lambda item: item[1], reverse=True):
+        if len(candidates) >= limit:
+            break
+        if path not in candidates:
+            candidates.append(path)
+    return candidates[:limit]
+
+
 def git_status(root: Path) -> dict[str, str]:
     try:
         completed = subprocess.run(
@@ -828,7 +891,7 @@ def settings_path_for_display(root: Path) -> Path:
 def update_settings(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
     current = load_settings(root)
     provider = str(payload.get("provider", current.provider)).strip() or "ollama"
-    if provider not in {"ollama", "openai-compatible"}:
+    if provider not in SUPPORTED_PROVIDERS:
         raise ValueError("Unsupported provider")
     timeout = int(payload.get("timeout_seconds", current.timeout_seconds))
     if timeout < 1:
@@ -840,9 +903,37 @@ def update_settings(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
         api_key_env_var=str(payload.get("api_key_env_var", current.api_key_env_var)).strip() or "OPENAI_API_KEY",
         model=str(payload.get("model", current.model)).strip() or current.model,
         timeout_seconds=timeout,
+        providers=_clean_provider_overrides(payload.get("providers"), current.providers),
+        mode_providers=_clean_mode_providers(payload.get("mode_providers"), current.mode_providers),
     )
     save_settings(root, settings)
     return settings_payload(root)
+
+
+def _clean_provider_overrides(
+    raw: Any, fallback: dict[str, dict[str, str]]
+) -> dict[str, dict[str, str]]:
+    if not isinstance(raw, dict):
+        return fallback
+    cleaned: dict[str, dict[str, str]] = {}
+    for provider_name, overrides in raw.items():
+        if not isinstance(overrides, dict):
+            continue
+        fields = {str(key): str(value).strip() for key, value in overrides.items() if str(value).strip()}
+        if fields:
+            cleaned[str(provider_name)] = fields
+    return cleaned
+
+
+def _clean_mode_providers(raw: Any, fallback: dict[str, str]) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return fallback
+    cleaned: dict[str, str] = {}
+    for mode, provider_name in raw.items():
+        provider_name = str(provider_name or "").strip()
+        if mode in WORK_MODES and provider_name in SUPPORTED_PROVIDERS:
+            cleaned[str(mode)] = provider_name
+    return cleaned
 
 
 def test_model_settings(root: Path, payload: dict[str, Any]) -> dict[str, str]:
@@ -866,23 +957,13 @@ def list_model_settings(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "pass", "models": models, "output": output}
 
 
-def model_client(settings: AgentSettings) -> OllamaClient | OpenAICompatibleClient:
-    if settings.provider == "ollama":
-        return OllamaClient(
-            base_url=settings.ollama_url,
-            model=settings.model,
-            timeout_seconds=settings.timeout_seconds,
-        )
-    if settings.provider == "openai-compatible":
-        if not settings.api_base_url:
-            raise ModelError("Remote API base URL is required for openai-compatible provider.")
-        return OpenAICompatibleClient(
-            base_url=settings.api_base_url,
-            model=settings.model,
-            api_key_env_var=settings.api_key_env_var,
-            timeout_seconds=settings.timeout_seconds,
-        )
-    raise ModelError(f"Unsupported provider `{settings.provider}`.")
+def model_client(settings: AgentSettings) -> OllamaClient | OpenAICompatibleClient | AnthropicClient:
+    return create_client(settings.provider_config())
+
+
+def model_client_for_mode(settings: AgentSettings, mode: str) -> OllamaClient | OpenAICompatibleClient | AnthropicClient:
+    """Resolve the client for one work mode, honoring a user's per-mode provider choice."""
+    return create_client(settings.provider_config_for_mode(mode))
 
 
 def _lint_javascript_like(content: str) -> list[dict[str, Any]]:
@@ -945,7 +1026,13 @@ def build_agent_prompt(root: Path, message: str, mode: str, open_files: list[str
         "plan": "Return an implementation plan with risks, tests, and documentation updates.",
         "debug": "Diagnose the issue, identify likely causes, and suggest safe next checks.",
         "hints": "Provide concise inline code hints without rewriting whole files.",
-        "agent": "Act as an approval-gated coding agent: propose concrete multi-file changes and explain what each change fixes.",
+        "agent": (
+            "Act as an approval-gated coding agent: do the requested work by producing real edits to "
+            "the candidate files shown below, then briefly explain what each change does. Only fall back "
+            "to describing what should change, without producing edits, if the request is genuinely too "
+            "large or ambiguous to edit safely right now — in that case say so plainly and say a plan or "
+            "a stronger model provider is needed."
+        ),
     }.get(mode, "Help the user safely understand and improve the codebase.")
 
     return f"""You are bb-code, a coding assistant embedded directly in a local web IDE with live filesystem access.
@@ -978,7 +1065,8 @@ Cloud-native service inventory:
 - Do not say you cannot access them.
 - Never apologize for lacking filesystem access — you have it through the context above.
 - Do not claim that you edited files unless the system explicitly confirms apply success.
-- In Agent mode, provide machine-applicable edits when feasible so the UI can apply them with approval.
+- In Agent mode, you must attempt real, machine-applicable edits so the UI can apply them with approval —
+  do not stop at a description of the change unless the task is genuinely too large/ambiguous to edit safely.
 - Do not propose background daemons or autonomous loops.
 - In Agent mode, name the specific files that should change and explain why.
 - Ask for user approval before any destructive or broad change.
@@ -1016,9 +1104,9 @@ def build_explorer_context(root: Path) -> str:
     return "\n".join(lines)
 
 
-def build_edit_suggestion_prompt(root: Path, message: str, open_files: list[str]) -> str:
+def build_edit_suggestion_prompt(root: Path, message: str, candidate_files: list[str]) -> str:
     files: list[str] = []
-    for rel_path in open_files[:6]:
+    for rel_path in candidate_files:
         try:
             file_data = read_workspace_file(root, rel_path)
         except (FileNotFoundError, ValueError):
@@ -1027,12 +1115,14 @@ def build_edit_suggestion_prompt(root: Path, message: str, open_files: list[str]
 
     explorer_context = build_explorer_context(root)
 
-    return f"""You are bb-code preparing approval-gated file edits.
+    return f"""You are bb-code, an approval-gated coding agent. Your job is to actually do the
+requested work by producing real file edits, not to just describe what someone else should do.
 
 Return JSON only. No Markdown. No prose outside JSON.
 
 Schema:
 {{
+  "status": "applied" | "needs_plan" | "unable",
   "edits": [
     {{
       "path": "relative/path",
@@ -1045,14 +1135,20 @@ Schema:
 }}
 
 Rules:
-- Only suggest edits for files that exist in the workspace shown below.
-- Prefer using currently open files when they are relevant to the request.
+- Do the work directly with edits whenever the request is a well-scoped change to one of the files
+  shown below. Set "status" to "applied" and return real edits — do not just explain what to do.
+- Only propose edits for files that exist in the workspace and whose full content is shown below.
+  Do not guess at file content you cannot see.
 - Prefer exact find/replace edits for small changes.
 - For insertions, use "find" as the nearby exact text and "replace" as that same text plus the insertion.
 - If a full file rewrite is truly needed, use "content" with the full replacement file content.
-- Keep changes minimal and directly related to the user request.
-- Do not include destructive changes.
-- If no safe edit is possible, return {{"edits": [], "notes": ["reason"]}}.
+- Keep changes minimal and directly related to the user request. Do not include destructive changes.
+- If the request needs more than about 5 files changed, spans multiple services, or involves an
+  architecture/design decision that should be reviewed before touching code, do NOT attempt edits.
+  Return {{"status": "needs_plan", "edits": [], "notes": ["one short reason"]}} instead.
+- If the request is small in scope but you cannot produce a confident edit because the relevant
+  file's content isn't shown below, return {{"status": "unable", "edits": [], "notes": ["which file(s)
+  you would need to see"]}}.
 
 Workspace Explorer context:
 {explorer_context}
@@ -1060,36 +1156,36 @@ Workspace Explorer context:
 User request:
 {message}
 
-Open files:
-{chr(10).join(files) if files else "No files opened."}
+Candidate files (their full current content, considered even if the user did not manually open them):
+{chr(10).join(files) if files else "No related files were found in the workspace for this request."}
 """
 
 
 def chat_with_model(root: Path, payload: dict[str, Any], settings_root: Path | None = None) -> dict[str, Any]:
     settings = resolve_settings(settings_root or root)
-    client = model_client(settings)
-    prompt = build_agent_prompt(
-        root,
-        str(payload.get("message", "")),
-        str(payload.get("mode", "agent")),
-        [str(item) for item in payload.get("openFiles", []) if isinstance(item, str)],
-    )
+    mode = str(payload.get("mode", "agent"))
+    message = str(payload.get("message", ""))
+    open_files = [str(item) for item in payload.get("openFiles", []) if isinstance(item, str)]
+    client = model_client_for_mode(settings, mode)
+
+    candidate_files = select_candidate_files(root, message, open_files) if mode == "agent" else open_files
+
+    prompt = build_agent_prompt(root, message, mode, candidate_files)
     try:
         response = normalize_chat_response(client.generate(prompt))
     except ModelError as exc:
         return {"role": "assistant", "content": f"Model error: {exc}", "edits": []}
 
     edits: list[dict[str, str]] = []
-    if str(payload.get("mode", "agent")) == "agent":
-        edit_prompt = build_edit_suggestion_prompt(
-            root,
-            str(payload.get("message", "")),
-            [str(item) for item in payload.get("openFiles", []) if isinstance(item, str)],
-        )
+    if mode == "agent":
+        edit_prompt = build_edit_suggestion_prompt(root, message, candidate_files)
+        status = "unable"
+        notes: list[str] = []
         try:
             edit_response = client.generate(edit_prompt)
             edits = parse_edit_suggestions(root, edit_response)
-            if not edits:
+            status, notes = parse_edit_status(edit_response)
+            if not edits and status not in {"needs_plan", "unable"}:
                 retry_prompt = (
                     "Convert the following draft into the exact JSON schema requested earlier. "
                     "Return JSON only, no markdown, no prose.\n\n"
@@ -1097,9 +1193,65 @@ def chat_with_model(root: Path, payload: dict[str, Any], settings_root: Path | N
                 )
                 retry_response = client.generate(retry_prompt)
                 edits = parse_edit_suggestions(root, retry_response)
+                if edits:
+                    status, notes = parse_edit_status(retry_response)
         except ModelError:
             edits = []
+            status = "unable"
+
+        if edits:
+            status = "applied"
+        elif status not in {"needs_plan", "unable"}:
+            status = "unable"
+
+        if status == "needs_plan":
+            response = _augment_with_plan(root, message, client, response, notes)
+        elif status == "unable":
+            response = _augment_with_escalation(settings, mode, response, notes)
+
     return {"role": "assistant", "content": response, "edits": edits}
+
+
+def _augment_with_plan(root: Path, message: str, client: Any, response: str, notes: list[str]) -> str:
+    reason = f" ({notes[0]})" if notes else ""
+    try:
+        target_context = context_path(root)
+        if target_context.exists():
+            context_markdown = target_context.read_text(encoding="utf-8")
+        else:
+            context_markdown = scan_repository(root).to_markdown()
+        plan_path = create_plan(root, message, context_markdown, client)
+    except ModelError as exc:
+        return (
+            f"{response}\n\n---\nThis looks like a multi-file or higher-risk change{reason}, so I held off "
+            f"on direct edits, but I could not generate a plan automatically either: {exc}. Try `bb-code plan "
+            f'"{message}"` once that is resolved.'
+        )
+    return (
+        f"{response}\n\n---\nThis looks like a multi-file or higher-risk change{reason}, so instead of editing "
+        f"files directly I generated an implementation plan: `{relative(plan_path, root)}`. Review it, then ask "
+        f"me to implement a specific step and I will make that edit directly."
+    )
+
+
+def _augment_with_escalation(settings: AgentSettings, mode: str, response: str, notes: list[str]) -> str:
+    reason = f" ({notes[0]})" if notes else ""
+    current_provider = settings.provider_for_mode(mode)
+    if current_provider in STRONG_PROVIDERS:
+        return (
+            f"{response}\n\n---\nI could not produce a confident, grounded edit for this request{reason}. "
+            f"Try opening or naming the specific file(s) that need to change, or narrow the request."
+        )
+    alternatives = [name for name in ("anthropic", "openai") if name != current_provider]
+    alternatives_text = " or ".join(PROVIDER_DISPLAY_NAMES[name] for name in alternatives)
+    current_label = PROVIDER_DISPLAY_NAMES.get(current_provider, current_provider)
+    return (
+        f"{response}\n\n---\nI could not produce a confident, grounded edit for this request{reason} using "
+        f"the current Agent-mode provider ({current_label}). If this keeps happening, assign a more capable "
+        f"provider to Agent mode in Settings — {alternatives_text} — or a larger self-hosted "
+        f"OpenAI-compatible model, or open the specific file(s) that need to change so there is concrete "
+        f"content to edit."
+    )
 
 
 def normalize_chat_response(raw: str) -> str:
@@ -1162,6 +1314,25 @@ def parse_edit_suggestions(root: Path, raw: str) -> list[dict[str, str]]:
             entry["replace"] = raw_replace
         parsed.append(entry)
     return parsed
+
+
+def parse_edit_status(raw: str) -> tuple[str, list[str]]:
+    text = raw.strip()
+    match = re.search(r"(?s)```(?:json)?\s*(\{.*\})\s*```", text)
+    if match:
+        text = match.group(1)
+    elif "{" in text and "}" in text:
+        text = text[text.find("{") : text.rfind("}") + 1]
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return "unable", []
+    if not isinstance(data, dict):
+        return "unable", []
+    status = str(data.get("status", "")).strip().lower()
+    notes_raw = data.get("notes", [])
+    notes = [str(item) for item in notes_raw if isinstance(item, str)] if isinstance(notes_raw, list) else []
+    return status, notes
 
 
 def _materialize_edit_content(original: str, edit: dict[str, Any]) -> str | None:
@@ -2876,18 +3047,40 @@ APP_HTML = r"""<!doctype html>
       await refreshModels(false);
     }
 
+    const PROVIDER_LABELS = {
+      "ollama": "Ollama (local)",
+      "openai-compatible": "OpenAI-compatible (custom / self-hosted)",
+      "openai": "OpenAI (ChatGPT)",
+      "anthropic": "Anthropic (Claude)"
+    };
+    const WORK_MODES = ["agent", "plan", "debug", "hints"];
+    const MODE_LABELS = { agent: "Agent", plan: "Plan", debug: "Debug", hints: "Hints" };
+
+    function providerOptionsHtml(selected) {
+      return Object.keys(PROVIDER_LABELS).map(value =>
+        `<option value="${value}" ${value === selected ? "selected" : ""}>${PROVIDER_LABELS[value]}</option>`
+      ).join("");
+    }
+
+    function modeProviderOptionsHtml(selected) {
+      const options = [`<option value="">(use default provider)</option>`];
+      for (const value of Object.keys(PROVIDER_LABELS)) {
+        options.push(`<option value="${value}" ${value === selected ? "selected" : ""}>${PROVIDER_LABELS[value]}</option>`);
+      }
+      return options.join("");
+    }
+
     function renderSettingsForm(data, modelData = null) {
       const settings = data.settings || {};
+      const modeProviders = settings.mode_providers || {};
+      const providers = settings.providers || {};
       const models = modelData && modelData.status === "pass" ? modelData.models || [] : [];
       const modelControl = models.length
         ? `<select id="settingsModel">${models.map(model => `<option value="${escapeHtml(model)}" ${model === settings.model ? "selected" : ""}>${escapeHtml(model)}</option>`).join("")}</select>`
         : `<input id="settingsModel" value="${escapeHtml(settings.model || "")}" />`;
       $("sideTool").innerHTML = `
         <label>Provider
-          <select id="settingsProvider">
-            <option value="ollama" ${settings.provider === "ollama" ? "selected" : ""}>Ollama</option>
-            <option value="openai-compatible" ${settings.provider === "openai-compatible" ? "selected" : ""}>OpenAI-compatible API</option>
-          </select>
+          <select id="settingsProvider">${providerOptionsHtml(settings.provider)}</select>
         </label>
         <label>Model${modelControl}</label>
         <label>Ollama URL<input id="settingsOllamaUrl" value="${escapeHtml(settings.ollama_url || "")}" /></label>
@@ -2897,6 +3090,20 @@ APP_HTML = r"""<!doctype html>
         <button id="refreshModels" class="small">Refresh Models</button>
         <button id="saveSettings" class="small">Save Settings</button>
         <button id="testSettings" class="small">Test Connection</button>
+        <div class="muted" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+          Provider per work type (optional, your choice) &mdash; each mode below uses the default
+          provider above unless you assign it a different one.
+        </div>
+        ${WORK_MODES.map(mode => `
+        <label>${MODE_LABELS[mode]}
+          <select id="modeProvider_${mode}">${modeProviderOptionsHtml(modeProviders[mode] || "")}</select>
+        </label>`).join("")}
+        <div class="muted" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+          Model override for a secondary provider (only used when picked for a work type above;
+          otherwise its built-in default model is used).
+        </div>
+        <label>Claude model<input id="providerModel_anthropic" placeholder="claude-sonnet-5" value="${escapeHtml((providers.anthropic || {}).model || "")}" /></label>
+        <label>ChatGPT model<input id="providerModel_openai" placeholder="gpt-4.1" value="${escapeHtml((providers.openai || {}).model || "")}" /></label>
       `;
       const modelStatus = modelData ? `\nModel discovery: ${modelData.status}\n${modelData.output || ""}` : "";
       $("tree").innerHTML = `<pre class="settings-status" style="background:transparent;padding:8px;color:#d4d4d4">Saved at ${escapeHtml(data.path)}\nAPI key env available: ${data.apiKeyAvailable ? "yes" : "no"}${escapeHtml(modelStatus)}</pre>`;
@@ -2910,13 +3117,24 @@ APP_HTML = r"""<!doctype html>
     }
 
     function collectSettingsForm() {
+      const mode_providers = {};
+      for (const mode of WORK_MODES) {
+        const el = document.getElementById(`modeProvider_${mode}`);
+        if (el && el.value) mode_providers[mode] = el.value;
+      }
+      const providers = {
+        anthropic: { model: (document.getElementById("providerModel_anthropic") || {}).value?.trim() || "" },
+        openai: { model: (document.getElementById("providerModel_openai") || {}).value?.trim() || "" }
+      };
       return {
         provider: $("settingsProvider").value,
         model: $("settingsModel").value.trim(),
         ollama_url: $("settingsOllamaUrl").value.trim(),
         api_base_url: $("settingsApiBaseUrl").value.trim(),
         api_key_env_var: $("settingsApiKeyEnvVar").value.trim(),
-        timeout_seconds: Number($("settingsTimeout").value || 120)
+        timeout_seconds: Number($("settingsTimeout").value || 120),
+        mode_providers,
+        providers
       };
     }
 

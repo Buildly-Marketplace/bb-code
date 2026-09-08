@@ -9,12 +9,14 @@ from rich.panel import Panel
 from rich.text import Text
 
 from .model_router import (
+    PROVIDER_DEFAULTS,
+    SUPPORTED_PROVIDERS,
     ModelError,
     ModelNotFoundError,
     ModelTimeoutError,
     OllamaClient,
     OllamaNotRunningError,
-    OpenAICompatibleClient,
+    create_client,
 )
 from .diagnostics import SelfDiagnosticEngine
 from .planner import create_plan
@@ -38,13 +40,7 @@ def init() -> None:
     """Create the local bb-code workspace."""
     repo_root = Path.cwd()
     ensure_bb_dirs(repo_root)
-    console.print("[green]Created local bb-code workspace:
-- .bb/
-- .bb/plans/
-- .bb/cache/:
-- .bb/
-- .bb/plans/
-- .bb/cache/[/green]")
+    console.print("[green]Created local bb-code workspace:[/green]")
     console.print(f"- {relative(repo_root / '.bb', repo_root)}/")
     console.print(f"- {relative(repo_root / '.bb' / 'plans', repo_root)}/")
     console.print(f"- {relative(repo_root / '.bb' / 'cache', repo_root)}/")
@@ -93,13 +89,28 @@ def show_settings() -> None:
 
 @settings_app.command("set")
 def set_settings(
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            help=f"Model provider. One of: {', '.join(SUPPORTED_PROVIDERS)}.",
+        ),
+    ] = None,
     ollama_url: Annotated[
         str | None,
         typer.Option("--ollama-url", help="Local or remote Ollama base URL."),
     ] = None,
+    api_base_url: Annotated[
+        str | None,
+        typer.Option("--api-base-url", help="Remote API base URL (openai, anthropic, openai-compatible)."),
+    ] = None,
+    api_key_env_var: Annotated[
+        str | None,
+        typer.Option("--api-key-env-var", help="Environment variable holding the remote API key."),
+    ] = None,
     model: Annotated[
         str | None,
-        typer.Option("--model", "-m", help="Default Ollama model."),
+        typer.Option("--model", "-m", help="Default model name for the selected provider."),
     ] = None,
     timeout: Annotated[
         int | None,
@@ -107,11 +118,17 @@ def set_settings(
     ] = None,
 ) -> None:
     """Update persisted bb-code settings."""
+    if provider is not None and provider not in SUPPORTED_PROVIDERS:
+        console.print(f"[red]Unsupported provider:[/red] {provider}")
+        console.print(f"Choose one of: {', '.join(SUPPORTED_PROVIDERS)}")
+        raise typer.Exit(code=1)
     repo_root = Path.cwd()
     current = load_settings(repo_root)
     updated = current.with_overrides(
-        provider="ollama",
+        provider=provider,
         ollama_url=ollama_url,
+        api_base_url=api_base_url,
+        api_key_env_var=api_key_env_var,
         model=model,
         timeout_seconds=timeout,
     )
@@ -124,6 +141,18 @@ def test_settings() -> None:
     """Test the configured model provider."""
     settings = resolve_settings(Path.cwd())
     _test_settings(settings)
+
+
+@settings_app.command("providers")
+def list_providers() -> None:
+    """List supported model providers and how to configure each one."""
+    for name in SUPPORTED_PROVIDERS:
+        defaults = PROVIDER_DEFAULTS[name]
+        env_var = defaults["api_key_env_var"] or "(none — local)"
+        console.print(f"[bold]{name}[/bold]")
+        console.print(f"  default model: {defaults['model']}")
+        console.print(f"  default base url: {defaults['base_url'] or '(none — set --api-base-url)'}")
+        console.print(f"  API key env var: {env_var}")
 
 
 @app.command()
@@ -173,11 +202,7 @@ def plan(
         timeout_seconds=timeout,
     )
     context_markdown = target_context.read_text(encoding="utf-8")
-    client = OllamaClient(
-        base_url=settings.ollama_url,
-        model=settings.model,
-        timeout_seconds=settings.timeout_seconds,
-    )
+    client = create_client(settings.provider_config_for_mode("plan"))
 
     try:
         target = create_plan(repo_root, task_description, context_markdown, client)
@@ -272,21 +297,15 @@ def ui(
 
 
 def _test_settings(settings: AgentSettings) -> None:
-    if settings.provider == "ollama":
-        client = OllamaClient(
-            base_url=settings.ollama_url,
-            model=settings.model,
-            timeout_seconds=settings.timeout_seconds,
-        )
-    elif settings.provider == "openai-compatible":
-        client = OpenAICompatibleClient(
-            base_url=settings.api_base_url,
-            model=settings.model,
-            api_key_env_var=settings.api_key_env_var,
-            timeout_seconds=settings.timeout_seconds,
-        )
-    else:
+    if settings.provider not in SUPPORTED_PROVIDERS:
         console.print(f"[red]Unsupported provider:[/red] {settings.provider}")
+        console.print(f"Choose one of: {', '.join(SUPPORTED_PROVIDERS)}")
+        raise typer.Exit(code=1)
+    config = settings.provider_config()
+    try:
+        client = create_client(config)
+    except ModelError as exc:
+        console.print(f"[red]Provider test failed:[/red] {exc}")
         raise typer.Exit(code=1)
     try:
         if isinstance(client, OllamaClient):
@@ -307,8 +326,8 @@ def _test_settings(settings: AgentSettings) -> None:
     except ModelError as exc:
         console.print(f"[red]Provider test failed:[/red] {exc}")
         raise typer.Exit(code=1)
-    endpoint = settings.ollama_url if settings.provider == "ollama" else settings.api_base_url
-    console.print(f"[green]Connected to[/green] {endpoint} [green]with model[/green] {settings.model}")
+    endpoint = config.base_url
+    console.print(f"[green]Connected to[/green] {endpoint} [green]with model[/green] {config.model}")
 
 
 def _load_error_context(error: str | None, error_file: Path | None) -> str:

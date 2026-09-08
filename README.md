@@ -132,6 +132,54 @@ bb-code settings set --ollama-url http://alderaan.home:11434 --model gemma3:late
 bb-code settings test
 ```
 
+## Model Providers
+
+bb-code defaults to a local Ollama model, but you can point it at any of the
+following providers instead, at your discretion:
+
+| Provider | `--provider` value | Needs |
+|---|---|---|
+| Ollama (local or remote) | `ollama` | Nothing — just a reachable Ollama host |
+| Custom OpenAI-compatible endpoint (e.g. a self-hosted Hermes model) | `openai-compatible` | `--api-base-url` and an API key env var |
+| OpenAI (ChatGPT) | `openai` | `OPENAI_API_KEY` set in your environment |
+| Anthropic (Claude) | `anthropic` | `ANTHROPIC_API_KEY` set in your environment |
+
+List the supported providers and their defaults:
+
+```bash
+bb-code settings providers
+```
+
+Switch the default provider:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+bb-code settings set --provider anthropic --model claude-sonnet-5
+bb-code settings test
+```
+
+### Per-mode providers (web UI)
+
+The workspace web UI (`bb-code ui`) has four work modes in the Agent Chat
+panel — Agent, Plan, Debug, Hints. Each one can be pinned to a different
+provider from the Settings panel, so you can, for example, keep local Ollama
+as the default but send Agent-mode (multi-file change) requests to Claude
+while Plan mode stays local. Any mode left on "(use default provider)" uses
+the top-level provider setting. This is stored in `.bb/settings.json` under
+`mode_providers`, e.g.:
+
+```json
+{
+  "provider": "ollama",
+  "mode_providers": { "agent": "anthropic" },
+  "providers": { "anthropic": { "model": "claude-opus-5" } }
+}
+```
+
+The optional `providers` block lets you override the model (or, if edited by
+hand, the base URL / API key env var) used for a provider that isn't your
+primary one.
+
 Use a different Ollama model:
 
 ```bash
@@ -218,7 +266,15 @@ The web UI includes:
 - Diagnostics and repository context panels
 - Buildly guidance for Python-first, Docker-first, cloud-native app work
 
-The UI can inspect multiple files and suggest multi-file changes. It does not silently edit files; suggested edits require an explicit Apply click for each file.
+The UI can inspect multiple files and suggest multi-file changes. It does not silently edit files; suggested edits require an explicit Apply click for each file (or the Auto-apply toggle).
+
+Agent mode does the work rather than just describing it: it searches the workspace for files relevant
+to your request (not only ones you have open), then attempts direct find/replace or full-file edits
+against them. If the request looks too large or ambiguous to edit safely (many files, an architecture
+decision), it generates an implementation plan under `.bb/plans/` instead of guessing. If it can't
+produce a confident edit and the current Agent-mode provider is a smaller/local model, it tells you so
+and suggests assigning a stronger provider — Claude, ChatGPT, or a larger self-hosted/Hermes-style
+OpenAI-compatible model — to Agent mode specifically (see Per-mode providers above).
 
 ## Repository Scanning
 

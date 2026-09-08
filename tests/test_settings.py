@@ -67,3 +67,59 @@ def test_agent_settings_loads_remote_api_fields(tmp_path: Path) -> None:
     assert settings.provider == "openai-compatible"
     assert settings.api_base_url == "https://api.example.com/v1"
     assert settings.api_key_env_var == "REMOTE_API_KEY"
+
+
+def test_provider_config_uses_default_provider_fields() -> None:
+    settings = AgentSettings(
+        provider="ollama",
+        ollama_url="http://alderaan.home:11434",
+        model="gemma3:latest",
+    )
+
+    config = settings.provider_config()
+
+    assert config.provider == "ollama"
+    assert config.base_url == "http://alderaan.home:11434"
+    assert config.model == "gemma3:latest"
+
+
+def test_provider_config_falls_back_to_builtin_defaults_for_secondary_provider() -> None:
+    settings = AgentSettings(provider="ollama")
+
+    config = settings.provider_config("anthropic")
+
+    assert config.provider == "anthropic"
+    assert config.base_url == "https://api.anthropic.com"
+    assert config.model == "claude-sonnet-5"
+    assert config.api_key_env_var == "ANTHROPIC_API_KEY"
+
+
+def test_provider_config_honors_per_provider_override() -> None:
+    settings = AgentSettings(
+        provider="ollama",
+        providers={"anthropic": {"model": "claude-opus-5"}},
+    )
+
+    config = settings.provider_config("anthropic")
+
+    assert config.model == "claude-opus-5"
+    assert config.base_url == "https://api.anthropic.com"
+
+
+def test_provider_for_mode_defaults_and_overrides() -> None:
+    settings = AgentSettings(provider="ollama", mode_providers={"agent": "anthropic"})
+
+    assert settings.provider_for_mode("agent") == "anthropic"
+    assert settings.provider_for_mode("plan") == "ollama"
+
+
+def test_resolve_settings_preserves_mode_providers(tmp_path: Path) -> None:
+    save_settings(
+        tmp_path,
+        AgentSettings(provider="ollama", mode_providers={"agent": "anthropic"}),
+    )
+
+    settings = resolve_settings(tmp_path)
+
+    assert settings.mode_providers == {"agent": "anthropic"}
+    assert settings.provider_config_for_mode("agent").provider == "anthropic"

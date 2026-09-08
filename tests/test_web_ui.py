@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from bb_code.settings import AgentSettings, save_settings
 from bb_code.web_ui import (
     APP_HTML,
     WorkspaceSession,
@@ -12,6 +13,7 @@ from bb_code.web_ui import (
     build_edit_suggestion_prompt,
     build_explorer_context,
     build_tree,
+    chat_with_model,
     collect_cloud_native_inventory,
     collect_database_and_model_inventory,
     collect_session_workspace,
@@ -22,11 +24,13 @@ from bb_code.web_ui import (
     lint_workspace_file,
     markdown_to_html,
     normalize_chat_response,
+    parse_edit_status,
     parse_edit_suggestions,
     read_report_file,
     read_workspace_file,
     render_report_html,
     scan_github_actions_deployments,
+    select_candidate_files,
     summarize_deployments,
     summarize_pods,
     search_workspace,
@@ -583,3 +587,105 @@ def test_parse_edit_suggestions_rejects_suspicious_tiny_replacement(tmp_path: Pa
     edits = parse_edit_suggestions(tmp_path, raw)
 
     assert edits == []
+
+
+def test_parse_edit_status_reads_status_and_notes() -> None:
+    raw = json_dumps({"status": "needs_plan", "edits": [], "notes": ["touches many services"]})
+
+    status, notes = parse_edit_status(raw)
+
+    assert status == "needs_plan"
+    assert notes == ["touches many services"]
+
+
+def test_select_candidate_files_discovers_relevant_file_without_being_open(tmp_path: Path) -> None:
+    (tmp_path / "greeting.py").write_text("def greeting():\n    return 'hi'\n", encoding="utf-8")
+    (tmp_path / "unrelated.py").write_text("def unrelated():\n    return 1\n", encoding="utf-8")
+
+    candidates = select_candidate_files(tmp_path, "please update the greeting function to say hello", [])
+
+    assert "greeting.py" in candidates
+
+
+class ScriptedClient:
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = list(responses)
+        self.calls: list[str] = []
+
+    def generate(self, prompt: str) -> str:
+        self.calls.append(prompt)
+        return self.responses.pop(0)
+
+
+def test_chat_with_model_agent_mode_returns_direct_edits(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    edit_json = json_dumps(
+        {
+            "status": "applied",
+            "edits": [{"path": "app.py", "summary": "Say bye", "find": "hi", "replace": "bye"}],
+            "notes": [],
+        }
+    )
+    client = ScriptedClient(["I'll update the greeting.", edit_json])
+    monkeypatch.setattr("bb_code.web_ui.model_client_for_mode", lambda settings, mode: client)
+
+    result = chat_with_model(
+        tmp_path, {"message": "change hi to bye in app.py", "mode": "agent", "openFiles": ["app.py"]}
+    )
+
+    assert len(result["edits"]) == 1
+    assert result["edits"][0]["path"] == "app.py"
+    assert "confident" not in result["content"].lower()
+
+
+def test_chat_with_model_generates_plan_when_task_is_flagged_too_large(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "README.md").write_text("# Example\n", encoding="utf-8")
+    plan_markdown = (
+        "## Feature Summary\n\nDo the thing.\n\n"
+        "## Relevant Files\n\n- README.md\n\n"
+        "## Implementation Steps\n\n1. Step.\n\n"
+        "## Risks\n\n- None.\n\n"
+        "## Test Plan\n\n- None.\n\n"
+        "## Documentation Updates\n\n- None.\n\n"
+        "## Open Questions\n\n- None.\n"
+    )
+    edit_json = json_dumps({"status": "needs_plan", "edits": [], "notes": ["touches many services"]})
+    client = ScriptedClient(["Here is my analysis.", edit_json, plan_markdown])
+    monkeypatch.setattr("bb_code.web_ui.model_client_for_mode", lambda settings, mode: client)
+
+    result = chat_with_model(
+        tmp_path, {"message": "rearchitect the whole auth system", "mode": "agent", "openFiles": []}
+    )
+
+    assert result["edits"] == []
+    assert "implementation plan" in result["content"].lower()
+    plans_dir = tmp_path / ".bb" / "plans"
+    assert plans_dir.exists()
+    assert any(plans_dir.iterdir())
+
+
+def test_chat_with_model_suggests_stronger_provider_when_edits_fail(tmp_path: Path, monkeypatch) -> None:
+    client = ScriptedClient(["I looked at this.", "not valid json at all"])
+    monkeypatch.setattr("bb_code.web_ui.model_client_for_mode", lambda settings, mode: client)
+
+    result = chat_with_model(tmp_path, {"message": "do something vague", "mode": "agent", "openFiles": []})
+
+    assert result["edits"] == []
+    content_lower = result["content"].lower()
+    assert "claude" in content_lower
+    assert "chatgpt" in content_lower
+
+
+def test_chat_with_model_escalation_skipped_when_mode_already_uses_strong_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
+    save_settings(tmp_path, AgentSettings(provider="ollama", mode_providers={"agent": "anthropic"}))
+    client = ScriptedClient(["I looked at this.", "not valid json at all"])
+    monkeypatch.setattr("bb_code.web_ui.model_client_for_mode", lambda settings, mode: client)
+
+    result = chat_with_model(tmp_path, {"message": "do something vague", "mode": "agent", "openFiles": []})
+
+    content_lower = result["content"].lower()
+    assert "claude" not in content_lower
+    assert "chatgpt" not in content_lower
+    assert "narrow the request" in content_lower
