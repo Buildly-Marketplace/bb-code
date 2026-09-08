@@ -38,7 +38,13 @@ def init() -> None:
     """Create the local bb-code workspace."""
     repo_root = Path.cwd()
     ensure_bb_dirs(repo_root)
-    console.print("[green]Created local bb-code workspace:[/green]")
+    console.print("[green]Created local bb-code workspace:
+- .bb/
+- .bb/plans/
+- .bb/cache/:
+- .bb/
+- .bb/plans/
+- .bb/cache/[/green]")
     console.print(f"- {relative(repo_root / '.bb', repo_root)}/")
     console.print(f"- {relative(repo_root / '.bb' / 'plans', repo_root)}/")
     console.print(f"- {relative(repo_root / '.bb' / 'cache', repo_root)}/")
